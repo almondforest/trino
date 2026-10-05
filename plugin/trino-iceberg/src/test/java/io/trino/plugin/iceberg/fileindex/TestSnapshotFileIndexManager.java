@@ -199,6 +199,25 @@ final class TestSnapshotFileIndexManager
     }
 
     @Test
+    void testSnapshotCloseToMaxFilesStaysIndexed()
+    {
+        List<Runnable> submitted = new ArrayList<>();
+        Executor buildExecutor = task -> {
+            submitted.add(task);
+            task.run();
+        };
+        SnapshotFileIndexManager manager = new SnapshotFileIndexManager(true, 1000, TESTING_TYPE_MANAGER, buildExecutor, planningExecutor);
+        Table table = createTable(Optional.of("id"));
+        appendFiles(table, 1000);
+        long snapshotId = table.currentSnapshot().snapshotId();
+
+        SnapshotFileIndex index = manager.find(table, snapshotId).orElseThrow();
+        assertThat(index.fileCount()).isEqualTo(1000);
+        assertThat(manager.find(table, snapshotId)).containsSame(index);
+        assertThat(submitted).hasSize(1);
+    }
+
+    @Test
     void testIndexesAreEvictedToStayWithinMaxFiles()
     {
         SnapshotFileIndexManager manager = new SnapshotFileIndexManager(true, 5, TESTING_TYPE_MANAGER, directExecutor(), planningExecutor);
