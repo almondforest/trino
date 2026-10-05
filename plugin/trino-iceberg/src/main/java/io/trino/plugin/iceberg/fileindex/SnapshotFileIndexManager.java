@@ -90,6 +90,9 @@ public class SnapshotFileIndexManager
         this.planningExecutor = requireNonNull(planningExecutor, "planningExecutor is null");
         this.indexes = EvictableCacheBuilder.newBuilder()
                 .maximumWeight(maxFiles)
+                // The cache splits the weight limit evenly between its segments, and drops an entry heavier than
+                // a segment's share as soon as it is added. One segment lets a single index use the whole limit.
+                .concurrencyLevel(1)
                 .weigher((IndexKey _, SnapshotFileIndex index) -> Math.max(1, index.fileCount()))
                 .build();
     }
