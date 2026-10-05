@@ -33,6 +33,7 @@ import org.apache.iceberg.encryption.PlaintextEncryptionManager;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -140,7 +141,13 @@ public class SnapshotFileIndexManager
     private void build(IndexKey key, Table table)
     {
         try {
-            Optional<SnapshotFileIndex> index = SnapshotFileIndex.build(table, key.snapshotId(), key.columns(), typeManager, planningExecutor, maxFiles);
+            // The index of another snapshot of the table shares most manifests with this one, and saves reading them again
+            Optional<SnapshotFileIndex> previous = indexes.asMap().keySet().stream()
+                    .filter(other -> other.tableLocation().equals(key.tableLocation()) && other.columns().equals(key.columns()) && !other.equals(key))
+                    .map(indexes::getIfPresent)
+                    .filter(Objects::nonNull)
+                    .findFirst();
+            Optional<SnapshotFileIndex> index = SnapshotFileIndex.build(table, key.snapshotId(), key.columns(), typeManager, planningExecutor, maxFiles, previous);
             if (index.isEmpty()) {
                 log.info("Not indexing snapshot %s of table %s: it has more than %s data files", key.snapshotId(), table.name(), maxFiles);
                 rejected.put(key, true);
@@ -150,7 +157,7 @@ public class SnapshotFileIndexManager
             // Queries move on to the new snapshot, so keeping the indexes of older ones would only hold memory.
             // A query that is still planning from an older index keeps its own reference to it.
             invalidateAllIf(indexes, other -> other.tableLocation().equals(key.tableLocation()) && !other.equals(key));
-            log.debug("Indexed %s data files of snapshot %s of table %s", index.orElseThrow().fileCount(), key.snapshotId(), table.name());
+            log.debug("Indexed %s data files of snapshot %s of table %s: %s", index.orElseThrow().fileCount(), key.snapshotId(), table.name(), index.orElseThrow().buildStatistics());
         }
         catch (RuntimeException e) {
             log.warn(e, "Failed to index snapshot %s of table %s", key.snapshotId(), table.name());

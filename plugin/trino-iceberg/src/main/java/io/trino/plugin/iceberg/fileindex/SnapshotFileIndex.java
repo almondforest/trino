@@ -24,13 +24,18 @@ import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeManager;
 import org.apache.iceberg.BaseFileScanTask;
+import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableScan;
@@ -50,6 +55,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -57,15 +63,22 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Throwables.throwIfUnchecked;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static io.trino.plugin.base.util.ExecutorUtil.processWithAdditionalThreads;
 import static io.trino.plugin.iceberg.ExpressionConverter.convertTrinoValueToIceberg;
 import static io.trino.plugin.iceberg.TypeConverter.toTrinoType;
+import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
+import static org.apache.iceberg.IcebergManifestUtils.liveEntries;
 import static org.apache.iceberg.util.SnapshotUtil.schemaFor;
 
 /**
@@ -80,10 +93,13 @@ import static org.apache.iceberg.util.SnapshotUtil.schemaFor;
  * finds the files whose bounds overlap the constraint.</li>
  * <li>The remaining files are checked against their column statistics.</li>
  * </ol>
- * A snapshot never changes, so an index never becomes stale.
+ * A snapshot never changes, so an index never becomes stale. The index of a new snapshot is built from the index of
+ * an older one where possible, see {@link #build}.
  */
 public final class SnapshotFileIndex
 {
+    private static final DeleteFile[] NO_DELETE_FILES = new DeleteFile[0];
+
     private final Schema schema;
     private final String schemaJson;
     private final Map<Integer, String> specJsons;
@@ -92,22 +108,30 @@ public final class SnapshotFileIndex
     private final List<PartitionGroup> partitionGroups;
     private final Set<Integer> statisticsColumnIds;
     private final Map<Integer, ColumnIndex<?>> columnIndexes;
+    // The files of each data manifest, kept so that the index of a later snapshot can take over the manifests it shares
+    // with this one. Empty when the file list came from a table scan.
+    private final Map<ManifestKey, DataFile[]> filesByManifest;
+    private final BuildStatistics buildStatistics;
 
     private SnapshotFileIndex(
             Schema schema,
             Map<Integer, PartitionSpec> specs,
-            List<DataFile> files,
-            List<DeleteFile[]> deleteFiles,
+            DataFile[] files,
+            DeleteFile[][] deleteFiles,
             List<NestedField> statisticsColumns,
-            TypeManager typeManager)
+            TypeManager typeManager,
+            Map<ManifestKey, DataFile[]> filesByManifest,
+            BuildStatistics buildStatistics)
     {
         this.schema = requireNonNull(schema, "schema is null");
         this.schemaJson = SchemaParser.toJson(schema);
-        this.files = files.toArray(DataFile[]::new);
-        this.deleteFiles = deleteFiles.toArray(DeleteFile[][]::new);
+        this.files = requireNonNull(files, "files is null");
+        this.deleteFiles = requireNonNull(deleteFiles, "deleteFiles is null");
         this.statisticsColumnIds = statisticsColumns.stream()
                 .map(NestedField::fieldId)
                 .collect(toImmutableSet());
+        this.filesByManifest = requireNonNull(filesByManifest, "filesByManifest is null");
+        this.buildStatistics = requireNonNull(buildStatistics, "buildStatistics is null");
 
         ImmutableMap.Builder<Integer, String> specJsons = ImmutableMap.builder();
         specs.forEach((specId, spec) -> specJsons.put(specId, PartitionSpecParser.toJson(spec)));
@@ -125,10 +149,16 @@ public final class SnapshotFileIndex
     }
 
     /**
-     * Reads the file list of the snapshot. Returns empty if the snapshot has more than {@code maxFiles} data files.
+     * Builds the index of a snapshot. Returns empty if the snapshot has more than {@code maxFiles} data files.
+     * <p>
+     * As long as the snapshot has no delete files, its file list is put together manifest by manifest, and the
+     * manifests it shares with {@code previous} are taken from there instead of being read again. Manifests are
+     * immutable, so this is the common case after an append or after whole partitions are dropped. A snapshot with
+     * delete files is read with a table scan, which also works out the delete files that apply to each data file.
      *
      * @param columnNames top-level columns to keep statistics for and to index; names that do not resolve to a
      *         primitive top-level column are ignored
+     * @param previous an index of another snapshot of the same table, if there is one
      */
     public static Optional<SnapshotFileIndex> build(
             Table table,
@@ -136,9 +166,11 @@ public final class SnapshotFileIndex
             List<String> columnNames,
             TypeManager typeManager,
             ExecutorService planningExecutor,
-            long maxFiles)
+            long maxFiles,
+            Optional<SnapshotFileIndex> previous)
     {
         checkArgument(maxFiles > 0, "maxFiles must be positive");
+        requireNonNull(previous, "previous is null");
         Schema schema = schemaFor(table, snapshotId);
         Map<String, NestedField> statisticsColumns = new LinkedHashMap<>();
         for (String columnName : columnNames) {
@@ -148,6 +180,24 @@ public final class SnapshotFileIndex
             }
         }
 
+        Snapshot snapshot = table.snapshot(snapshotId);
+        checkArgument(snapshot != null, "Snapshot %s not found in table %s", snapshotId, table.name());
+        boolean hasDeleteFiles = snapshot.deleteManifests(table.io()).stream().anyMatch(SnapshotFileIndex::hasLiveFiles);
+        if (hasDeleteFiles) {
+            return buildFromScan(table, snapshotId, schema, statisticsColumns, typeManager, planningExecutor, maxFiles);
+        }
+        return buildFromManifests(table, snapshot, schema, ImmutableList.copyOf(statisticsColumns.values()), typeManager, planningExecutor, maxFiles, previous);
+    }
+
+    private static Optional<SnapshotFileIndex> buildFromScan(
+            Table table,
+            long snapshotId,
+            Schema schema,
+            Map<String, NestedField> statisticsColumns,
+            TypeManager typeManager,
+            ExecutorService planningExecutor,
+            long maxFiles)
+    {
         TableScan scan = table.newScan()
                 .useSnapshot(snapshotId)
                 .planWith(planningExecutor);
@@ -173,10 +223,131 @@ public final class SnapshotFileIndex
         return Optional.of(new SnapshotFileIndex(
                 schema,
                 table.specs(),
+                files.toArray(DataFile[]::new),
+                deleteFiles.toArray(DeleteFile[][]::new),
+                ImmutableList.copyOf(statisticsColumns.values()),
+                typeManager,
+                ImmutableMap.of(),
+                new BuildStatistics(false, 0, 0)));
+    }
+
+    private static Optional<SnapshotFileIndex> buildFromManifests(
+            Table table,
+            Snapshot snapshot,
+            Schema schema,
+            List<NestedField> statisticsColumns,
+            TypeManager typeManager,
+            ExecutorService planningExecutor,
+            long maxFiles,
+            Optional<SnapshotFileIndex> previous)
+    {
+        List<ManifestFile> manifests = snapshot.dataManifests(table.io()).stream()
+                .filter(SnapshotFileIndex::hasLiveFiles)
+                .collect(toImmutableList());
+
+        // The manifest list usually says how many files each manifest holds, so a snapshot that is too large is turned down before reading any of them
+        long knownFileCount = 0;
+        for (ManifestFile manifest : manifests) {
+            if (manifest.addedFilesCount() != null && manifest.existingFilesCount() != null) {
+                knownFileCount += manifest.addedFilesCount() + manifest.existingFilesCount();
+            }
+        }
+        if (knownFileCount > maxFiles) {
+            return Optional.empty();
+        }
+
+        Set<Integer> statisticsColumnIds = statisticsColumns.stream()
+                .map(NestedField::fieldId)
+                .collect(toImmutableSet());
+        // Files of the previous index carry the statistics of its columns, so they only fit an index of the same columns
+        Map<ManifestKey, DataFile[]> reusable = previous
+                .filter(index -> index.statisticsColumnIds.equals(statisticsColumnIds))
+                .map(index -> index.filesByManifest)
+                .orElse(ImmutableMap.of());
+
+        List<ManifestKey> keys = manifests.stream()
+                .map(ManifestKey::of)
+                .collect(toImmutableList());
+        List<Integer> manifestsToRead = new ArrayList<>();
+        for (int i = 0; i < keys.size(); i++) {
+            if (!reusable.containsKey(keys.get(i))) {
+                manifestsToRead.add(i);
+            }
+        }
+        List<Callable<DataFile[]>> readTasks = manifestsToRead.stream()
+                .map(manifests::get)
+                .map(manifest -> (Callable<DataFile[]>) () -> readDataFiles(table, manifest, statisticsColumnIds))
+                .collect(toImmutableList());
+        List<DataFile[]> readFiles;
+        try {
+            readFiles = processWithAdditionalThreads(readTasks, planningExecutor);
+        }
+        catch (ExecutionException e) {
+            throwIfUnchecked(e.getCause());
+            throw new RuntimeException(e.getCause());
+        }
+
+        Map<ManifestKey, DataFile[]> filesByManifest = new LinkedHashMap<>();
+        for (int i = 0; i < manifestsToRead.size(); i++) {
+            filesByManifest.put(keys.get(manifestsToRead.get(i)), readFiles.get(i));
+        }
+        long fileCount = 0;
+        for (ManifestKey key : keys) {
+            fileCount += filesByManifest.computeIfAbsent(key, reusable::get).length;
+        }
+        if (fileCount > maxFiles) {
+            return Optional.empty();
+        }
+
+        DataFile[] files = new DataFile[toIntExact(fileCount)];
+        int position = 0;
+        // in the order of the manifest list, so that the order of files does not depend on which manifests were reused
+        for (ManifestKey key : keys) {
+            DataFile[] manifestFiles = filesByManifest.get(key);
+            System.arraycopy(manifestFiles, 0, files, position, manifestFiles.length);
+            position += manifestFiles.length;
+        }
+        DeleteFile[][] deleteFiles = new DeleteFile[files.length][];
+        Arrays.fill(deleteFiles, NO_DELETE_FILES);
+
+        return Optional.of(new SnapshotFileIndex(
+                schema,
+                table.specs(),
                 files,
                 deleteFiles,
-                ImmutableList.copyOf(statisticsColumns.values()),
-                typeManager));
+                statisticsColumns,
+                typeManager,
+                ImmutableMap.copyOf(filesByManifest),
+                new BuildStatistics(true, manifestsToRead.size(), keys.size() - manifestsToRead.size())));
+    }
+
+    private static DataFile[] readDataFiles(Table table, ManifestFile manifest, Set<Integer> statisticsColumnIds)
+            throws IOException
+    {
+        List<DataFile> files = new ArrayList<>();
+        try (ManifestReader<DataFile> reader = ManifestFiles.read(manifest, table.io(), table.specs());
+                CloseableIterable<ContentFile<DataFile>> entries = liveEntries(reader)) {
+            // the reader reuses the object it returns, so every file is copied, keeping statistics of the indexed columns only
+            for (ContentFile<DataFile> entry : entries) {
+                if (statisticsColumnIds.isEmpty()) {
+                    files.add(entry.copyWithoutStats());
+                }
+                else {
+                    files.add(entry.copyWithStats(statisticsColumnIds));
+                }
+            }
+        }
+        return files.toArray(DataFile[]::new);
+    }
+
+    private static boolean hasLiveFiles(ManifestFile manifest)
+    {
+        return manifest.hasAddedFiles() || manifest.hasExistingFiles();
+    }
+
+    public BuildStatistics buildStatistics()
+    {
+        return buildStatistics;
     }
 
     public int fileCount()
@@ -309,6 +480,34 @@ public final class SnapshotFileIndex
         {
             requireNonNull(tasks, "tasks is null");
             requireNonNull(matchedFiles, "matchedFiles is null");
+        }
+    }
+
+    /**
+     * How the file list was put together.
+     *
+     * @param fromManifests whether data manifests were read one by one, as opposed to running a table scan
+     * @param manifestsRead data manifests read from storage; zero for a table scan
+     * @param manifestsReused data manifests taken over from the previous index
+     */
+    public record BuildStatistics(boolean fromManifests, int manifestsRead, int manifestsReused) {}
+
+    /**
+     * Identifies a manifest file as one snapshot lists it. The path alone names the file; the other fields are the
+     * values that the manifest list assigns to it and that its entries inherit.
+     */
+    private record ManifestKey(String path, long length, int partitionSpecId, long sequenceNumber, long minSequenceNumber, Long addedSnapshotId, Long firstRowId)
+    {
+        static ManifestKey of(ManifestFile manifest)
+        {
+            return new ManifestKey(
+                    manifest.path(),
+                    manifest.length(),
+                    manifest.partitionSpecId(),
+                    manifest.sequenceNumber(),
+                    manifest.minSequenceNumber(),
+                    manifest.snapshotId(),
+                    manifest.firstRowId());
         }
     }
 

@@ -140,6 +140,46 @@ final class TestIcebergFileIndexFileOperations
     }
 
     @Test
+    void testAppendsAndPartitionDrops()
+    {
+        String table = "test_file_index_partitioned_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + table + " (id BIGINT, name VARCHAR, day DATE) " +
+                "WITH (partitioning = ARRAY['day'], extra_properties = MAP(ARRAY['" + FILE_INDEX_COLUMNS + "'], ARRAY['name']))");
+        assertUpdate("INSERT INTO " + table + " VALUES (1, 'a', DATE '2024-01-01'), (2, 'b', DATE '2024-01-01')", 2);
+        assertUpdate("INSERT INTO " + table + " VALUES (3, 'c', DATE '2024-01-02'), (4, 'd', DATE '2024-01-02')", 2);
+        assertUpdate("INSERT INTO " + table + " VALUES (5, 'a', DATE '2024-01-03'), (6, 'e', DATE '2024-01-03')", 2);
+        @Language("SQL") String query = "SELECT id FROM " + table + " WHERE name = 'a'";
+
+        assertQuery(query, "VALUES 1, 5");
+        assertEventually(() -> assertThat(manifestReads(query)).isZero());
+        assertQuery(query, "VALUES 1, 5");
+
+        // each new snapshot gets its index from the previous one; results must be right before and after it is ready
+        for (int day = 4; day <= 8; day++) {
+            assertUpdate("INSERT INTO " + table + " VALUES (" + (day * 10) + ", 'a', DATE '2024-01-0" + day + "'), (" + (day * 10 + 1) + ", 'f', DATE '2024-01-0" + day + "')", 2);
+        }
+        assertQuery(query, "VALUES 1, 5, 40, 50, 60, 70, 80");
+        assertEventually(() -> assertThat(manifestReads(query)).isZero());
+        assertQuery(query, "VALUES 1, 5, 40, 50, 60, 70, 80");
+
+        // dropping whole partitions removes files without writing delete files
+        assertUpdate("DELETE FROM " + table + " WHERE day < DATE '2024-01-03'", 4);
+        assertQuery(query, "VALUES 5, 40, 50, 60, 70, 80");
+        assertEventually(() -> assertThat(manifestReads(query)).isZero());
+        assertQuery(query, "VALUES 5, 40, 50, 60, 70, 80");
+        assertQuery("SELECT id FROM " + table + " WHERE name = 'a' AND day = DATE '2024-01-05'", "VALUES 50");
+        assertQueryReturnsEmptyResult("SELECT id FROM " + table + " WHERE name = 'c'");
+        assertQuery("SELECT count(*) FROM " + table, "VALUES 12");
+
+        assertUpdate("INSERT INTO " + table + " VALUES (90, 'a', DATE '2024-01-09')", 1);
+        assertQuery(query, "VALUES 5, 40, 50, 60, 70, 80, 90");
+        assertEventually(() -> assertThat(manifestReads(query)).isZero());
+        assertQuery(query, "VALUES 5, 40, 50, 60, 70, 80, 90");
+
+        assertUpdate("DROP TABLE " + table);
+    }
+
+    @Test
     void testTableWithoutIndexedColumnsIsPlannedFromManifests()
     {
         String table = "test_no_file_index_" + randomNameSuffix();
