@@ -1,0 +1,139 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.trino.plugin.iceberg;
+
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Multiset;
+import io.trino.Session;
+import io.trino.plugin.iceberg.util.FileOperationUtils.FileOperation;
+import io.trino.plugin.iceberg.util.FileOperationUtils.FileType;
+import io.trino.testing.AbstractTestQueryFramework;
+import io.trino.testing.DistributedQueryRunner;
+import io.trino.testing.QueryRunner;
+import org.intellij.lang.annotations.Language;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
+
+import java.nio.file.Path;
+
+import static com.google.common.collect.ImmutableMultiset.toImmutableMultiset;
+import static io.trino.plugin.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
+import static io.trino.plugin.iceberg.fileindex.SnapshotFileIndexManager.FILE_INDEX_COLUMNS;
+import static io.trino.plugin.iceberg.util.FileOperationUtils.FileType.MANIFEST;
+import static io.trino.plugin.iceberg.util.FileOperationUtils.FileType.SNAPSHOT;
+import static io.trino.plugin.iceberg.util.FileOperationUtils.getOperations;
+import static io.trino.testing.TestingNames.randomNameSuffix;
+import static io.trino.testing.TestingSession.testSessionBuilder;
+import static io.trino.testing.assertions.Assert.assertEventually;
+import static org.assertj.core.api.Assertions.assertThat;
+
+@Execution(ExecutionMode.SAME_THREAD)
+final class TestIcebergFileIndexFileOperations
+        extends AbstractTestQueryFramework
+{
+    @Override
+    protected QueryRunner createQueryRunner()
+            throws Exception
+    {
+        Session session = testSessionBuilder()
+                .setCatalog(ICEBERG_CATALOG)
+                .setSchema("test_schema")
+                // table statistics are read from manifests, independently of split planning
+                .setCatalogSessionProperty(ICEBERG_CATALOG, "statistics_enabled", "false")
+                .build();
+
+        QueryRunner queryRunner = DistributedQueryRunner.builder(session)
+                .setWorkerCount(0)
+                .build();
+
+        Path dataDirectory = queryRunner.getCoordinator().getBaseDataDir().resolve("iceberg_data");
+        dataDirectory.toFile().mkdirs();
+        queryRunner.installPlugin(new TestingIcebergPlugin(dataDirectory));
+        queryRunner.createCatalog(ICEBERG_CATALOG, "iceberg", ImmutableMap.<String, String>builder()
+                .put("iceberg.split-manager-threads", "0")
+                .put("iceberg.metadata-cache.enabled", "false")
+                .put("iceberg.file-index.enabled", "true")
+                .put("iceberg.allowed-extra-properties", FILE_INDEX_COLUMNS)
+                .buildOrThrow());
+        queryRunner.execute("CREATE SCHEMA test_schema");
+        return queryRunner;
+    }
+
+    @Test
+    void testSplitsPlannedFromIndex()
+    {
+        String table = "test_file_index_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + table + " (id BIGINT, name VARCHAR) WITH (extra_properties = MAP(ARRAY['" + FILE_INDEX_COLUMNS + "'], ARRAY['id']))");
+        assertUpdate("INSERT INTO " + table + " VALUES (1, 'a'), (2, 'b')", 2);
+        assertUpdate("INSERT INTO " + table + " VALUES (100, 'c'), (101, 'd')", 2);
+        assertUpdate("INSERT INTO " + table + " VALUES (200, 'e'), (201, 'f')", 2);
+        @Language("SQL") String query = "SELECT name FROM " + table + " WHERE id = 100";
+
+        // the first query finds no index: it plans from manifests and starts the build
+        assertThat(manifestReads(query)).isGreaterThan(0);
+        assertQuery(query, "VALUES 'c'");
+        // once the index is built, split planning reads neither the manifest list nor manifests
+        assertEventually(() -> assertThat(manifestReads(query)).isZero());
+        assertQuery(query, "VALUES 'c'");
+        assertQuery("SELECT name FROM " + table + " WHERE id BETWEEN 2 AND 200", "VALUES 'b', 'c', 'd', 'e'");
+        assertQuery("SELECT count(*) FROM " + table, "VALUES 6");
+        assertQueryReturnsEmptyResult("SELECT name FROM " + table + " WHERE id = 50");
+
+        // a filter on a column the index holds no statistics for is planned from manifests
+        @Language("SQL") String nameQuery = "SELECT id FROM " + table + " WHERE name = 'c'";
+        assertThat(manifestReads(nameQuery)).isGreaterThan(0);
+        assertQuery(nameQuery, "VALUES 100");
+
+        // a new snapshot is visible immediately, and gets its own index
+        assertUpdate("INSERT INTO " + table + " VALUES (100, 'z')", 1);
+        assertQuery(query, "VALUES 'c', 'z'");
+        assertEventually(() -> assertThat(manifestReads(query)).isZero());
+        assertQuery(query, "VALUES 'c', 'z'");
+
+        // row-level deletes are applied to splits planned from the index
+        assertUpdate("DELETE FROM " + table + " WHERE name = 'z'", 1);
+        assertQuery(query, "VALUES 'c'");
+        assertEventually(() -> assertThat(manifestReads(query)).isZero());
+        assertQuery(query, "VALUES 'c'");
+
+        assertUpdate("DROP TABLE " + table);
+    }
+
+    @Test
+    void testTableWithoutIndexedColumnsIsPlannedFromManifests()
+    {
+        String table = "test_no_file_index_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + table + " (id BIGINT, name VARCHAR)");
+        assertUpdate("INSERT INTO " + table + " VALUES (1, 'a'), (2, 'b')", 2);
+        @Language("SQL") String query = "SELECT name FROM " + table + " WHERE id = 1";
+
+        for (int i = 0; i < 3; i++) {
+            assertThat(manifestReads(query)).isGreaterThan(0);
+        }
+        assertQuery(query, "VALUES 'a'");
+
+        assertUpdate("DROP TABLE " + table);
+    }
+
+    private synchronized int manifestReads(@Language("SQL") String query)
+    {
+        getDistributedQueryRunner().executeWithPlan(getSession(), query);
+        Multiset<FileType> readFileTypes = getOperations(getDistributedQueryRunner().getSpans()).stream()
+                .filter(operation -> operation.operationType().startsWith("InputFile."))
+                .map(FileOperation::fileType)
+                .collect(toImmutableMultiset());
+        return readFileTypes.count(MANIFEST) + readFileTypes.count(SNAPSHOT);
+    }
+}

@@ -18,6 +18,8 @@ import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.inject.Inject;
 import io.trino.filesystem.cache.SplitAffinityProvider;
 import io.trino.plugin.base.classloader.ClassLoaderSafeConnectorSplitSource;
+import io.trino.plugin.iceberg.fileindex.SnapshotFileIndex;
+import io.trino.plugin.iceberg.fileindex.SnapshotFileIndexManager;
 import io.trino.plugin.iceberg.functions.tablechanges.TableChangesFunctionHandle;
 import io.trino.plugin.iceberg.functions.tablechanges.TableChangesSplitSource;
 import io.trino.spi.connector.ColumnHandle;
@@ -43,6 +45,7 @@ import org.apache.iceberg.metrics.MetricsReporter;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.SnapshotUtil;
 
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 
@@ -62,6 +65,7 @@ public class IcebergSplitManager
     private final ExecutorService icebergPlanningExecutor;
     private final SplitAffinityProvider splitAffinityProvider;
     private final ConnectorExpressionEvaluator evaluator;
+    private final SnapshotFileIndexManager fileIndexManager;
 
     @Inject
     public IcebergSplitManager(
@@ -71,7 +75,8 @@ public class IcebergSplitManager
             @ForIcebergSplitSource ListeningExecutorService splitSourceExecutor,
             @ForIcebergSplitManager ExecutorService icebergPlanningExecutor,
             SplitAffinityProvider splitAffinityProvider,
-            ConnectorExpressionEvaluator evaluator)
+            ConnectorExpressionEvaluator evaluator,
+            SnapshotFileIndexManager fileIndexManager)
     {
         this.transactionManager = requireNonNull(transactionManager, "transactionManager is null");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
@@ -80,6 +85,7 @@ public class IcebergSplitManager
         this.icebergPlanningExecutor = requireNonNull(icebergPlanningExecutor, "icebergPlanningExecutor is null");
         this.splitAffinityProvider = requireNonNull(splitAffinityProvider, "splitAffinityProvider is null");
         this.evaluator = requireNonNull(evaluator, "evaluator is null");
+        this.fileIndexManager = requireNonNull(fileIndexManager, "fileIndexManager is null");
     }
 
     @Override
@@ -104,6 +110,13 @@ public class IcebergSplitManager
         InMemoryMetricsReporter metricsReporter = new InMemoryMetricsReporter();
         Scan scan = getScan(icebergMetadata, icebergTable, table, metricsReporter, icebergPlanningExecutor);
 
+        // The index holds the plain file list of a snapshot, so it cannot serve an incremental scan,
+        // and OPTIMIZE needs every file of the partitions it rewrites
+        Optional<SnapshotFileIndex> fileIndex = Optional.empty();
+        if (!table.isRecordScannedFiles() && icebergMetadata.getIncrementalRefreshFromSnapshot().isEmpty()) {
+            fileIndex = fileIndexManager.find(icebergTable, table.getSnapshotId().orElseThrow());
+        }
+
         IcebergSplitSource splitSource = new IcebergSplitSource(
                 fileSystemFactory,
                 session,
@@ -119,7 +132,8 @@ public class IcebergSplitManager
                 metricsReporter,
                 splitSourceExecutor,
                 dynamicFilterColumns,
-                evaluator);
+                evaluator,
+                fileIndex);
 
         return new ClassLoaderSafeConnectorSplitSource(splitSource, IcebergSplitManager.class.getClassLoader());
     }

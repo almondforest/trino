@@ -17,6 +17,7 @@ import com.google.inject.Inject;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperations;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperationsProvider;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.catalog.TrinoCatalog;
 import io.trino.plugin.iceberg.encryption.EncryptionManagerFactory;
 import io.trino.plugin.iceberg.fileio.ForwardingFileIoFactory;
@@ -35,18 +36,21 @@ public class IcebergNessieTableOperationsProvider
     private final ForwardingFileIoFactory fileIoFactory;
     private final NessieIcebergClient nessieClient;
     private final EncryptionManagerFactory encryptionManagerFactory;
+    private final TableMetadataCache tableMetadataCache;
 
     @Inject
     public IcebergNessieTableOperationsProvider(
             TrinoFileSystemFactory fileSystemFactory,
             ForwardingFileIoFactory fileIoFactory,
             NessieIcebergClient nessieClient,
-            EncryptionManagerFactory encryptionManagerFactory)
+            EncryptionManagerFactory encryptionManagerFactory,
+            TableMetadataCache tableMetadataCache)
     {
         this.fileSystemFactory = requireNonNull(fileSystemFactory, "fileSystemFactory is null");
         this.fileIoFactory = requireNonNull(fileIoFactory, "fileIoFactory is null");
         this.nessieClient = requireNonNull(nessieClient, "nessieClient is null");
         this.encryptionManagerFactory = requireNonNull(encryptionManagerFactory, "encryptionManagerFactory is null");
+        this.tableMetadataCache = requireNonNull(tableMetadataCache, "tableMetadataCache is null");
     }
 
     @Override
@@ -66,6 +70,7 @@ public class IcebergNessieTableOperationsProvider
                 table,
                 owner,
                 location,
-                encryptionManagerFactory);
+                encryptionManagerFactory,
+                tableMetadataCache);
     }
 }

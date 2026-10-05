@@ -20,6 +20,7 @@ import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.plugin.iceberg.ForIcebergMetadata;
 import io.trino.plugin.iceberg.IcebergConfig;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperationsProvider;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.catalog.TrinoCatalog;
 import io.trino.plugin.iceberg.catalog.TrinoCatalogFactory;
 import io.trino.plugin.iceberg.fileio.ForwardingFileIoFactory;
@@ -56,6 +57,7 @@ public class TrinoJdbcCatalogFactory
     private final Map<String, String> catalogProperties;
     private final JdbcClientPool clientPool;
     private final Executor metadataFetchingExecutor;
+    private final TableMetadataCache tableMetadataCache;
 
     @Inject
     public TrinoJdbcCatalogFactory(
@@ -67,7 +69,8 @@ public class TrinoJdbcCatalogFactory
             IcebergJdbcClient jdbcClient,
             IcebergJdbcCatalogConfig jdbcConfig,
             IcebergConfig icebergConfig,
-            @ForIcebergMetadata ExecutorService metadataExecutorService)
+            @ForIcebergMetadata ExecutorService metadataExecutorService,
+            TableMetadataCache tableMetadataCache)
     {
         this.catalogName = requireNonNull(catalogName, "catalogName is null");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
@@ -79,6 +82,7 @@ public class TrinoJdbcCatalogFactory
         this.jdbcCatalogName = jdbcConfig.getCatalogName();
         this.schemaVersion = jdbcConfig.getSchemaVersion();
         this.defaultWarehouseDir = jdbcConfig.getDefaultWarehouseDir();
+        this.tableMetadataCache = requireNonNull(tableMetadataCache, "tableMetadataCache is null");
 
         ImmutableMap.Builder<String, String> properties = ImmutableMap.builder();
         properties.put(URI, jdbcConfig.getConnectionUrl());
@@ -126,6 +130,7 @@ public class TrinoJdbcCatalogFactory
                 isUniqueTableLocation,
                 defaultWarehouseDir,
                 schemaVersion,
-                metadataFetchingExecutor);
+                metadataFetchingExecutor,
+                tableMetadataCache);
     }
 }

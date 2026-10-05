@@ -17,6 +17,7 @@ import com.google.inject.Inject;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperations;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperationsProvider;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.catalog.TrinoCatalog;
 import io.trino.plugin.iceberg.encryption.EncryptionManagerFactory;
 import io.trino.plugin.iceberg.fileio.ForwardingFileIoFactory;
@@ -34,18 +35,21 @@ public class IcebergJdbcTableOperationsProvider
     private final ForwardingFileIoFactory fileIoFactory;
     private final IcebergJdbcClient jdbcClient;
     private final EncryptionManagerFactory encryptionManagerFactory;
+    private final TableMetadataCache tableMetadataCache;
 
     @Inject
     public IcebergJdbcTableOperationsProvider(
             TrinoFileSystemFactory fileSystemFactory,
             ForwardingFileIoFactory fileIoFactory,
             IcebergJdbcClient jdbcClient,
-            EncryptionManagerFactory encryptionManagerFactory)
+            EncryptionManagerFactory encryptionManagerFactory,
+            TableMetadataCache tableMetadataCache)
     {
         this.fileSystemFactory = requireNonNull(fileSystemFactory, "fileSystemFactory is null");
         this.fileIoFactory = requireNonNull(fileIoFactory, "fileIoFactory is null");
         this.jdbcClient = requireNonNull(jdbcClient, "jdbcClient is null");
         this.encryptionManagerFactory = requireNonNull(encryptionManagerFactory, "encryptionManagerFactory is null");
+        this.tableMetadataCache = requireNonNull(tableMetadataCache, "tableMetadataCache is null");
     }
 
     @Override
@@ -65,6 +69,7 @@ public class IcebergJdbcTableOperationsProvider
                 table,
                 owner,
                 location,
-                encryptionManagerFactory);
+                encryptionManagerFactory,
+                tableMetadataCache);
     }
 }

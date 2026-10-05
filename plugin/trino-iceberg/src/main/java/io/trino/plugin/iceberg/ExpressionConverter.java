@@ -324,7 +324,7 @@ public final class ExpressionConverter
      * Convert value from Trino representation to Iceberg representation for use in expressions.
      * For nano timestamps, the value must be verified to be in range before calling this method.
      */
-    private static Object convertTrinoValueToIceberg(Type type, Object trinoNativeValue)
+    public static Object convertTrinoValueToIceberg(Type type, Object trinoNativeValue)
     {
         requireNonNull(trinoNativeValue, "trinoNativeValue is null");
         // this method should not be used for values outside supported range

@@ -35,6 +35,8 @@ import io.trino.plugin.base.metrics.IntList;
 import io.trino.plugin.base.metrics.LongCount;
 import io.trino.plugin.iceberg.IcebergSplit.ParquetFileDecryptionData;
 import io.trino.plugin.iceberg.delete.DeleteFile;
+import io.trino.plugin.iceberg.fileindex.SnapshotFileIndex;
+import io.trino.plugin.iceberg.fileindex.SnapshotFileIndex.FileIndexScan;
 import io.trino.plugin.iceberg.util.DataFileWithDeleteFiles;
 import io.trino.spi.SplitWeight;
 import io.trino.spi.TrinoException;
@@ -176,7 +178,9 @@ public class IcebergSplitSource
     private final OptionalLong limit;
     private final Set<Integer> predicatedColumnIds;
     private final ListeningExecutorService executor;
+    private final Optional<SnapshotFileIndex> fileIndex;
 
+    private volatile Optional<FileIndexScan> fileIndexScan = Optional.empty();
     @GuardedBy("this")
     private TupleDomain<IcebergColumnHandle> pushedDownDynamicFilterPredicate;
     @GuardedBy("this")
@@ -219,7 +223,8 @@ public class IcebergSplitSource
             InMemoryMetricsReporter metricsReporter,
             ListeningExecutorService executor,
             Set<ColumnHandle> dynamicFilterColumns,
-            ConnectorExpressionEvaluator evaluator)
+            ConnectorExpressionEvaluator evaluator,
+            Optional<SnapshotFileIndex> fileIndex)
     {
         this.fileSystemFactory = requireNonNull(fileSystemFactory, "fileSystemFactory is null");
         this.session = requireNonNull(session, "session is null");
@@ -257,6 +262,9 @@ public class IcebergSplitSource
         this.splitAffinityProvider = requireNonNull(splitAffinityProvider, "splitAffinityProvider is null");
         this.metricsReporter = requireNonNull(metricsReporter, "metricsReporter is null");
         this.executor = requireNonNull(executor, "executor is null");
+        // Without statistics for a filtered column the index would return files that planning from manifests prunes
+        this.fileIndex = requireNonNull(fileIndex, "fileIndex is null")
+                .filter(index -> index.hasStatisticsFor(predicatedColumnIds));
     }
 
     @Override
@@ -307,10 +315,16 @@ public class IcebergSplitSource
                                 .filter(Objects::nonNull)
                                 .collect(toImmutableList()));
             }
+            this.fileIndexScan = fileIndex.map(index -> index.planFiles(filterExpression, effectivePredicate));
 
             synchronized (closer) {
                 checkState(!closed, "split source is closed");
-                this.fileScanIterable = closer.register(scan.planFiles());
+                if (fileIndexScan.isPresent()) {
+                    this.fileScanIterable = closer.register(fileIndexScan.orElseThrow().tasks());
+                }
+                else {
+                    this.fileScanIterable = closer.register(scan.planFiles());
+                }
                 Optional<DataSize> sessionSplitSize = getSplitSize(session);
                 // Row group merging is only enabled when the split size is explicitly configured.
                 // If a writer set read.split.target-size on the table, they may rely on
@@ -554,6 +568,16 @@ public class IcebergSplitSource
     @Override
     public Metrics getMetrics()
     {
+        Optional<FileIndexScan> fileIndexScan = this.fileIndexScan;
+        if (fileIndexScan.isPresent()) {
+            FileIndexScan scan = fileIndexScan.orElseThrow();
+            return new Metrics(ImmutableMap.<String, Metric<?>>builder()
+                    .put("fileIndexFiles", new LongCount(scan.indexedFiles()))
+                    .put("fileIndexPartitionCandidates", new LongCount(scan.partitionCandidates()))
+                    .put("fileIndexColumnCandidates", new LongCount(scan.columnCandidates()))
+                    .put("dataFiles", new LongCount(scan.matchedFiles().get()))
+                    .buildOrThrow());
+        }
         ScanReport scanReport = metricsReporter.scanReport();
         if (scanReport == null) {
             return Metrics.EMPTY;

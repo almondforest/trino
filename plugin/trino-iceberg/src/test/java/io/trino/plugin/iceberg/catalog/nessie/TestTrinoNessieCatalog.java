@@ -14,12 +14,15 @@
 package io.trino.plugin.iceberg.catalog.nessie;
 
 import com.google.common.collect.ImmutableMap;
+import io.airlift.testing.TestingTicker;
+import io.airlift.units.Duration;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.filesystem.hdfs.HdfsFileSystemFactory;
 import io.trino.plugin.iceberg.CommitTaskData;
 import io.trino.plugin.iceberg.IcebergMetadata;
 import io.trino.plugin.iceberg.TableStatisticsWriter;
 import io.trino.plugin.iceberg.catalog.BaseTrinoCatalogTest;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.catalog.TrinoCatalog;
 import io.trino.plugin.iceberg.containers.NessieContainer;
 import io.trino.spi.NodeVersion;
@@ -27,10 +30,15 @@ import io.trino.spi.catalog.CatalogName;
 import io.trino.spi.connector.ConnectorExpressionEvaluator;
 import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.connector.TableNotFoundException;
 import io.trino.spi.security.PrincipalType;
 import io.trino.spi.security.TrinoPrincipal;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.nessie.NessieIcebergClient;
+import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -45,6 +53,7 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static com.google.common.util.concurrent.MoreExecutors.newDirectExecutorService;
@@ -61,6 +70,7 @@ import static io.trino.testing.TestingNames.randomNameSuffix;
 import static io.trino.type.InternalTypeManager.TESTING_TYPE_MANAGER;
 import static java.nio.file.Files.createTempDirectory;
 import static java.util.Locale.ENGLISH;
+import static java.util.concurrent.TimeUnit.MINUTES;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
@@ -111,22 +121,95 @@ public class TestTrinoNessieCatalog
         catch (IOException e) {
             fail(e.getMessage());
         }
-        TrinoFileSystemFactory fileSystemFactory = new HdfsFileSystemFactory(HDFS_ENVIRONMENT, HDFS_FILE_SYSTEM_STATS);
+        return createTrinoNessieCatalog(createNessieClient(), tmpDirectory, useUniqueTableLocations, TableMetadataCache.disabled());
+    }
+
+    private NessieIcebergClient createNessieClient()
+    {
         IcebergNessieCatalogConfig icebergNessieCatalogConfig = new IcebergNessieCatalogConfig()
                 .setServerUri(URI.create(nessieContainer.getRestApiUri()));
         NessieApiV2 nessieApi = NessieClientBuilder.createClientBuilderFromSystemSettings()
                 .withUri(nessieContainer.getRestApiUri())
                 .build(NessieApiV2.class);
-        NessieIcebergClient nessieClient = new NessieIcebergClient(nessieApi, icebergNessieCatalogConfig.getDefaultReferenceName(), null, ImmutableMap.of());
+        return new NessieIcebergClient(nessieApi, icebergNessieCatalogConfig.getDefaultReferenceName(), null, ImmutableMap.of());
+    }
+
+    private static TrinoCatalog createTrinoNessieCatalog(NessieIcebergClient nessieClient, Path warehouseDirectory, boolean useUniqueTableLocations, TableMetadataCache tableMetadataCache)
+    {
+        TrinoFileSystemFactory fileSystemFactory = new HdfsFileSystemFactory(HDFS_ENVIRONMENT, HDFS_FILE_SYSTEM_STATS);
         return new TrinoNessieCatalog(
                 new CatalogName("catalog_name"),
                 TESTING_TYPE_MANAGER,
                 fileSystemFactory,
                 FILE_IO_FACTORY,
-                new IcebergNessieTableOperationsProvider(fileSystemFactory, FILE_IO_FACTORY, nessieClient, ENCRYPTION_MANAGER_FACTORY),
+                new IcebergNessieTableOperationsProvider(fileSystemFactory, FILE_IO_FACTORY, nessieClient, ENCRYPTION_MANAGER_FACTORY, tableMetadataCache),
                 nessieClient,
-                tmpDirectory.toAbsolutePath().toString(),
-                useUniqueTableLocations);
+                warehouseDirectory.toAbsolutePath().toString(),
+                useUniqueTableLocations,
+                tableMetadataCache);
+    }
+
+    @Test
+    public void testTableMetadataCache()
+            throws Exception
+    {
+        Path warehouseDirectory = createTempDirectory("test_nessie_catalog_table_metadata_cache_");
+        warehouseDirectory.toFile().deleteOnExit();
+
+        TestingTicker ticker = new TestingTicker();
+        TableMetadataCache tableMetadataCache = new TableMetadataCache(new Duration(5, MINUTES), ticker);
+        // A catalog instance lives for one transaction, so each load below uses a new instance sharing the cache and the client
+        NessieIcebergClient nessieClient = createNessieClient();
+        Supplier<TrinoCatalog> cachingCatalog = () -> createTrinoNessieCatalog(nessieClient, warehouseDirectory, false, tableMetadataCache);
+        // Stands for another engine changing the table
+        NessieIcebergClient otherNessieClient = createNessieClient();
+        Supplier<TrinoCatalog> otherCatalog = () -> createTrinoNessieCatalog(otherNessieClient, warehouseDirectory, false, TableMetadataCache.disabled());
+
+        String namespace = "test_table_metadata_cache_" + randomNameSuffix();
+        SchemaTableName table = new SchemaTableName(namespace, "cached_table");
+        TrinoCatalog catalog = cachingCatalog.get();
+        catalog.createNamespace(SESSION, namespace, defaultNamespaceProperties(namespace), new TrinoPrincipal(PrincipalType.USER, SESSION.getUser()));
+        try {
+            catalog.newCreateTableTransaction(
+                            SESSION,
+                            table,
+                            new Schema(Types.NestedField.optional(1, "col1", Types.LongType.get())),
+                            PartitionSpec.unpartitioned(),
+                            SortOrder.unsorted(),
+                            Optional.of(arbitraryTableLocation(catalog, SESSION, table)),
+                            ImmutableMap.of())
+                    .commitTransaction();
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).doesNotContainKey("marker");
+
+            // a change made elsewhere stays invisible while the entry is alive
+            otherCatalog.get().loadTable(SESSION, table).updateProperties().set("marker", "external").commit();
+            ticker.increment(4, MINUTES);
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).doesNotContainKey("marker");
+
+            // and shows up once the entry expires
+            ticker.increment(2, MINUTES);
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).containsEntry("marker", "external");
+
+            // a change made through the caching catalog is visible immediately
+            cachingCatalog.get().loadTable(SESSION, table).updateProperties().set("marker", "own").commit();
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).containsEntry("marker", "own");
+
+            // a commit that starts from stale cached metadata still succeeds and keeps the other engine's change
+            otherCatalog.get().loadTable(SESSION, table).updateProperties().set("external_marker", "external").commit();
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).doesNotContainKey("external_marker");
+            cachingCatalog.get().loadTable(SESSION, table).updateProperties().set("marker", "own again").commit();
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties())
+                    .containsEntry("marker", "own again")
+                    .containsEntry("external_marker", "external");
+
+            // dropping the table removes the entry
+            cachingCatalog.get().dropTable(SESSION, table);
+            assertThatThrownBy(() -> cachingCatalog.get().loadTable(SESSION, table))
+                    .isInstanceOf(TableNotFoundException.class);
+        }
+        finally {
+            catalog.dropNamespace(SESSION, namespace);
+        }
     }
 
     @Test
@@ -148,10 +231,11 @@ public class TestTrinoNessieCatalog
                 TESTING_TYPE_MANAGER,
                 fileSystemFactory,
                 FILE_IO_FACTORY,
-                new IcebergNessieTableOperationsProvider(fileSystemFactory, FILE_IO_FACTORY, nessieClient, ENCRYPTION_MANAGER_FACTORY),
+                new IcebergNessieTableOperationsProvider(fileSystemFactory, FILE_IO_FACTORY, nessieClient, ENCRYPTION_MANAGER_FACTORY, TableMetadataCache.disabled()),
                 nessieClient,
                 icebergNessieCatalogConfig.getDefaultWarehouseDir(),
-                false);
+                false,
+                TableMetadataCache.disabled());
 
         String namespace = "test_default_location_" + randomNameSuffix();
         String table = "tableName";

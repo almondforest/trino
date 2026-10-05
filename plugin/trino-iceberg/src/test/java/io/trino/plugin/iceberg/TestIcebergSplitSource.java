@@ -627,7 +627,8 @@ public class TestIcebergSplitSource
                 new InMemoryMetricsReporter(),
                 newDirectExecutorService(),
                 dynamicFilterColumns,
-                ConnectorExpressionEvaluator.NO_OP)) {
+                ConnectorExpressionEvaluator.NO_OP,
+                Optional.empty())) {
             ImmutableList.Builder<IcebergSplit> builder = ImmutableList.builder();
             while (!splitSource.isFinished()) {
                 splitSource.getNextBatch(100, dynamicFilterSnapshot).get()

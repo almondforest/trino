@@ -14,14 +14,23 @@
 package io.trino.plugin.iceberg.catalog.jdbc;
 
 import com.google.common.collect.ImmutableMap;
+import io.airlift.testing.TestingTicker;
+import io.airlift.units.Duration;
 import io.trino.metastore.TableInfo.ExtendedRelationType;
 import io.trino.plugin.base.util.AutoCloseableCloser;
 import io.trino.plugin.iceberg.catalog.BaseTrinoCatalogTest;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.catalog.TrinoCatalog;
 import io.trino.spi.catalog.CatalogName;
+import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.connector.TableNotFoundException;
 import io.trino.spi.security.PrincipalType;
 import io.trino.spi.security.TrinoPrincipal;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.jdbc.JdbcCatalog;
+import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -33,6 +42,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.trino.hdfs.HdfsTestUtils.HDFS_FILE_SYSTEM_FACTORY;
@@ -41,14 +51,17 @@ import static io.trino.plugin.iceberg.IcebergTestUtils.FILE_IO_FACTORY;
 import static io.trino.plugin.iceberg.catalog.jdbc.IcebergJdbcCatalogConfig.SchemaVersion.V1;
 import static io.trino.plugin.iceberg.catalog.jdbc.TestingIcebergJdbcServer.PASSWORD;
 import static io.trino.plugin.iceberg.catalog.jdbc.TestingIcebergJdbcServer.USER;
+import static io.trino.testing.TestingNames.randomNameSuffix;
 import static io.trino.type.InternalTypeManager.TESTING_TYPE_MANAGER;
 import static java.util.Locale.ENGLISH;
+import static java.util.concurrent.TimeUnit.MINUTES;
 import static org.apache.iceberg.CatalogProperties.CATALOG_IMPL;
 import static org.apache.iceberg.CatalogProperties.URI;
 import static org.apache.iceberg.CatalogProperties.WAREHOUSE_LOCATION;
 import static org.apache.iceberg.CatalogUtil.buildIcebergCatalog;
 import static org.apache.iceberg.jdbc.JdbcCatalog.PROPERTY_PREFIX;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
 
 @TestInstance(PER_CLASS)
@@ -81,10 +94,15 @@ final class TestTrinoJdbcCatalog
         warehouseLocation.toFile().deleteOnExit();
         JdbcCatalog jdbcCatalog = createJdbcCatalog(server.getJdbcUrl(), warehouseLocation);
         closer.register(jdbcCatalog);
-        return createTrinoJdbcCatalog(useUniqueTableLocations, warehouseLocation, server.getJdbcUrl(), jdbcCatalog);
+        return createTrinoJdbcCatalog(useUniqueTableLocations, warehouseLocation, server.getJdbcUrl(), jdbcCatalog, TableMetadataCache.disabled());
     }
 
-    private static TrinoJdbcCatalog createTrinoJdbcCatalog(boolean useUniqueTableLocations, Path warehouseLocation, String jdbcUrl, JdbcCatalog jdbcCatalog)
+    private static TrinoJdbcCatalog createTrinoJdbcCatalog(
+            boolean useUniqueTableLocations,
+            Path warehouseLocation,
+            String jdbcUrl,
+            JdbcCatalog jdbcCatalog,
+            TableMetadataCache tableMetadataCache)
     {
         IcebergJdbcClient jdbcClient = new IcebergJdbcClient(
                 new IcebergJdbcConnectionFactory(new Driver(), jdbcUrl, Optional.of(USER), Optional.of(PASSWORD)),
@@ -93,7 +111,7 @@ final class TestTrinoJdbcCatalog
         return new TrinoJdbcCatalog(
                 new CatalogName(CATALOG_NAME),
                 TESTING_TYPE_MANAGER,
-                new IcebergJdbcTableOperationsProvider(HDFS_FILE_SYSTEM_FACTORY, FILE_IO_FACTORY, jdbcClient, ENCRYPTION_MANAGER_FACTORY),
+                new IcebergJdbcTableOperationsProvider(HDFS_FILE_SYSTEM_FACTORY, FILE_IO_FACTORY, jdbcClient, ENCRYPTION_MANAGER_FACTORY, tableMetadataCache),
                 jdbcCatalog,
                 jdbcClient,
                 HDFS_FILE_SYSTEM_FACTORY,
@@ -101,7 +119,8 @@ final class TestTrinoJdbcCatalog
                 useUniqueTableLocations,
                 warehouseLocation.toAbsolutePath().toString(),
                 V1,
-                directExecutor());
+                directExecutor(),
+                tableMetadataCache);
     }
 
     private static JdbcCatalog createJdbcCatalog(String jdbcUrl, Path warehouseLocation)
@@ -155,6 +174,69 @@ final class TestTrinoJdbcCatalog
                     // JDBC catalog lowercases namespaces returned from listNamespaces
                     .doesNotContain(namespace)
                     .contains(schema);
+        }
+        finally {
+            catalog.dropNamespace(SESSION, namespace);
+        }
+    }
+
+    @Test
+    void testTableMetadataCache()
+            throws Exception
+    {
+        Path warehouseLocation = Files.createTempDirectory(null);
+        warehouseLocation.toFile().deleteOnExit();
+        JdbcCatalog jdbcCatalog = createJdbcCatalog(server.getJdbcUrl(), warehouseLocation);
+        closer.register(jdbcCatalog);
+
+        TestingTicker ticker = new TestingTicker();
+        TableMetadataCache tableMetadataCache = new TableMetadataCache(new Duration(5, MINUTES), ticker);
+        // A catalog instance lives for one transaction, so each load below uses a new instance sharing the cache
+        Supplier<TrinoCatalog> cachingCatalog = () -> createTrinoJdbcCatalog(false, warehouseLocation, server.getJdbcUrl(), jdbcCatalog, tableMetadataCache);
+        // Stands for another engine changing the table
+        Supplier<TrinoCatalog> otherCatalog = () -> createTrinoJdbcCatalog(false, warehouseLocation, server.getJdbcUrl(), jdbcCatalog, TableMetadataCache.disabled());
+
+        String namespace = "test_table_metadata_cache_" + randomNameSuffix();
+        SchemaTableName table = new SchemaTableName(namespace, "cached_table");
+        TrinoCatalog catalog = cachingCatalog.get();
+        catalog.createNamespace(SESSION, namespace, defaultNamespaceProperties(namespace), new TrinoPrincipal(PrincipalType.USER, SESSION.getUser()));
+        try {
+            catalog.newCreateTableTransaction(
+                            SESSION,
+                            table,
+                            new Schema(Types.NestedField.optional(1, "col1", Types.LongType.get())),
+                            PartitionSpec.unpartitioned(),
+                            SortOrder.unsorted(),
+                            Optional.of(arbitraryTableLocation(catalog, SESSION, table)),
+                            ImmutableMap.of())
+                    .commitTransaction();
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).doesNotContainKey("marker");
+
+            // a change made elsewhere stays invisible while the entry is alive
+            otherCatalog.get().loadTable(SESSION, table).updateProperties().set("marker", "external").commit();
+            ticker.increment(4, MINUTES);
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).doesNotContainKey("marker");
+
+            // and shows up once the entry expires
+            ticker.increment(2, MINUTES);
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).containsEntry("marker", "external");
+
+            // a change made through the caching catalog is visible immediately
+            cachingCatalog.get().loadTable(SESSION, table).updateProperties().set("marker", "own").commit();
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).containsEntry("marker", "own");
+
+            // a commit that starts from stale cached metadata still succeeds and keeps the other engine's change
+            otherCatalog.get().loadTable(SESSION, table).updateProperties().set("external_marker", "external").commit();
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties()).doesNotContainKey("external_marker");
+            cachingCatalog.get().loadTable(SESSION, table).updateProperties().set("marker", "own again").commit();
+            assertThat(cachingCatalog.get().loadTable(SESSION, table).properties())
+                    .containsEntry("marker", "own again")
+                    .containsEntry("external_marker", "external");
+
+            // dropping the table removes the entry
+            cachingCatalog.get().dropTable(SESSION, table);
+            assertThatThrownBy(() -> cachingCatalog.get().loadTable(SESSION, table))
+                    .isInstanceOf(TableNotFoundException.class);
         }
         finally {
             catalog.dropNamespace(SESSION, namespace);

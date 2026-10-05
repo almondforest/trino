@@ -22,6 +22,7 @@ import io.airlift.configuration.LegacyConfig;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import io.airlift.units.MinDataSize;
+import io.airlift.units.MinDuration;
 import io.trino.filesystem.Location;
 import io.trino.plugin.base.configuration.ThreadCountParser;
 import io.trino.plugin.hive.HiveCompressionOption;
@@ -105,6 +106,9 @@ public class IcebergConfig
     private int materializedViewRefreshMaxSnapshotsToExpire = 200;
     private Duration materializedViewRefreshSnapshotRetentionPeriod = new Duration(4, HOURS);
     private boolean metadataCacheEnabled = true;
+    private Duration tableMetadataCacheTtl = new Duration(0, SECONDS);
+    private boolean fileIndexEnabled;
+    private long fileIndexMaxFiles = 1_000_000;
     private boolean objectStoreLayoutEnabled;
     private int metadataParallelism = 8;
     private boolean metadataVirtualThreadsEnabled = true;
@@ -661,6 +665,48 @@ public class IcebergConfig
     public IcebergConfig setMetadataCacheEnabled(boolean metadataCacheEnabled)
     {
         this.metadataCacheEnabled = metadataCacheEnabled;
+        return this;
+    }
+
+    @NotNull
+    @MinDuration("0s")
+    public Duration getTableMetadataCacheTtl()
+    {
+        return tableMetadataCacheTtl;
+    }
+
+    @Config("iceberg.table-metadata-cache.ttl")
+    @ConfigDescription("Duration for which loaded table metadata is reused across queries on the coordinator, even if the table changes in the catalog. Set to 0s to disable")
+    public IcebergConfig setTableMetadataCacheTtl(Duration tableMetadataCacheTtl)
+    {
+        this.tableMetadataCacheTtl = tableMetadataCacheTtl;
+        return this;
+    }
+
+    public boolean isFileIndexEnabled()
+    {
+        return fileIndexEnabled;
+    }
+
+    @Config("iceberg.file-index.enabled")
+    @ConfigDescription("Plan splits from an in-memory index of a snapshot's data files for tables that declare indexed columns")
+    public IcebergConfig setFileIndexEnabled(boolean fileIndexEnabled)
+    {
+        this.fileIndexEnabled = fileIndexEnabled;
+        return this;
+    }
+
+    @Min(1)
+    public long getFileIndexMaxFiles()
+    {
+        return fileIndexMaxFiles;
+    }
+
+    @Config("iceberg.file-index.max-files")
+    @ConfigDescription("Maximum number of data files held in memory across all indexed snapshots")
+    public IcebergConfig setFileIndexMaxFiles(long fileIndexMaxFiles)
+    {
+        this.fileIndexMaxFiles = fileIndexMaxFiles;
         return this;
     }
 

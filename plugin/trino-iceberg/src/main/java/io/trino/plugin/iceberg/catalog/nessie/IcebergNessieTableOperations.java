@@ -14,6 +14,7 @@
 package io.trino.plugin.iceberg.catalog.nessie;
 
 import io.trino.plugin.iceberg.catalog.AbstractIcebergTableOperations;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.encryption.EncryptionManagerFactory;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ConnectorSession;
@@ -54,9 +55,10 @@ public class IcebergNessieTableOperations
             String table,
             Optional<String> owner,
             Optional<String> location,
-            EncryptionManagerFactory encryptionManagerFactory)
+            EncryptionManagerFactory encryptionManagerFactory,
+            TableMetadataCache tableMetadataCache)
     {
-        super(fileIo, session, database, table, owner, location, encryptionManagerFactory);
+        super(fileIo, session, database, table, owner, location, encryptionManagerFactory, tableMetadataCache);
         this.nessieClient = requireNonNull(nessieClient, "nessieClient is null");
     }
 

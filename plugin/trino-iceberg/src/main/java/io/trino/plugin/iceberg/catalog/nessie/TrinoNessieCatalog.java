@@ -22,6 +22,7 @@ import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.metastore.TableInfo;
 import io.trino.plugin.iceberg.catalog.AbstractTrinoCatalog;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperationsProvider;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.fileio.ForwardingFileIoFactory;
 import io.trino.spi.TrinoException;
 import io.trino.spi.catalog.CatalogName;
@@ -78,6 +79,7 @@ public class TrinoNessieCatalog
 
     private final String warehouseLocation;
     private final NessieIcebergClient nessieClient;
+    private final TableMetadataCache sharedTableMetadataCache;
 
     private final Cache<SchemaTableName, TableMetadata> tableMetadataCache = EvictableCacheBuilder.newBuilder()
             .maximumSize(PER_QUERY_CACHE_SIZE)
@@ -91,11 +93,13 @@ public class TrinoNessieCatalog
             IcebergTableOperationsProvider tableOperationsProvider,
             NessieIcebergClient nessieClient,
             String warehouseLocation,
-            boolean useUniqueTableLocation)
+            boolean useUniqueTableLocation,
+            TableMetadataCache sharedTableMetadataCache)
     {
         super(catalogName, useUniqueTableLocation, typeManager, tableOperationsProvider, fileSystemFactory, fileIoFactory);
         this.warehouseLocation = requireNonNull(warehouseLocation, "warehouseLocation is null");
         this.nessieClient = requireNonNull(nessieClient, "nessieClient is null");
+        this.sharedTableMetadataCache = requireNonNull(sharedTableMetadataCache, "sharedTableMetadataCache is null");
     }
 
     @Override
@@ -217,7 +221,7 @@ public class TrinoNessieCatalog
             metadata = uncheckedCacheGet(
                     tableMetadataCache,
                     table,
-                    () -> {
+                    () -> sharedTableMetadataCache.load(table, () -> {
                         TableOperations operations = tableOperationsProvider.createTableOperations(
                                 this,
                                 session,
@@ -226,7 +230,7 @@ public class TrinoNessieCatalog
                                 Optional.empty(),
                                 Optional.empty());
                         return new BaseTable(operations, quotedTableName(table)).operations().current();
-                    });
+                    }));
         }
         catch (UncheckedExecutionException e) {
             throwIfUnchecked(e.getCause());
@@ -275,6 +279,7 @@ public class TrinoNessieCatalog
     {
         nessieClient.renameTable(toIdentifier(from), toIdentifier(to));
         invalidateTableCache(from);
+        invalidateTableCache(to);
     }
 
     @Override
@@ -472,5 +477,6 @@ public class TrinoNessieCatalog
     protected void invalidateTableCache(SchemaTableName schemaTableName)
     {
         tableMetadataCache.invalidate(schemaTableName);
+        sharedTableMetadataCache.invalidate(schemaTableName);
     }
 }

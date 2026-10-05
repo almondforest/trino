@@ -40,6 +40,7 @@ import static io.trino.plugin.iceberg.ParquetFooterCacheType.MEMORY;
 import static io.trino.plugin.iceberg.ParquetFooterCacheType.NONE;
 import static java.util.concurrent.TimeUnit.DAYS;
 import static java.util.concurrent.TimeUnit.HOURS;
+import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 public class TestIcebergConfig
@@ -84,6 +85,9 @@ public class TestIcebergConfig
                 .setAllowedExtraProperties(ImmutableList.of())
                 .setIncrementalRefreshEnabled(true)
                 .setMetadataCacheEnabled(true)
+                .setTableMetadataCacheTtl(new Duration(0, SECONDS))
+                .setFileIndexEnabled(false)
+                .setFileIndexMaxFiles(1_000_000)
                 .setIncrementalRefreshEnabled(true)
                 .setMaterializedViewRefreshMaxSnapshotsToExpire(200)
                 .setMaterializedViewRefreshSnapshotRetentionPeriod(new Duration(4, HOURS))
@@ -138,6 +142,9 @@ public class TestIcebergConfig
                 .put("iceberg.materialized-views.refresh-max-snapshots-to-expire", "5")
                 .put("iceberg.materialized-views.refresh-snapshot-retention-period", "1h")
                 .put("iceberg.metadata-cache.enabled", "false")
+                .put("iceberg.table-metadata-cache.ttl", "5m")
+                .put("iceberg.file-index.enabled", "true")
+                .put("iceberg.file-index.max-files", "5000")
                 .put("iceberg.object-store-layout.enabled", "true")
                 .put("iceberg.metadata.parallelism", "10")
                 .put("iceberg.metadata.virtual-threads-enabled", "false")
@@ -184,6 +191,9 @@ public class TestIcebergConfig
                 .setAllowedExtraProperties(ImmutableList.of("propX", "propY"))
                 .setIncrementalRefreshEnabled(false)
                 .setMetadataCacheEnabled(false)
+                .setTableMetadataCacheTtl(new Duration(5, MINUTES))
+                .setFileIndexEnabled(true)
+                .setFileIndexMaxFiles(5000)
                 .setIncrementalRefreshEnabled(false)
                 .setMaterializedViewRefreshMaxSnapshotsToExpire(5)
                 .setMaterializedViewRefreshSnapshotRetentionPeriod(new Duration(1, HOURS))

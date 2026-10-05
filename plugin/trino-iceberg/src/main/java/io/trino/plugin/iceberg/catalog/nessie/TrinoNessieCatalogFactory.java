@@ -17,6 +17,7 @@ import com.google.inject.Inject;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.plugin.iceberg.IcebergConfig;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperationsProvider;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.catalog.TrinoCatalog;
 import io.trino.plugin.iceberg.catalog.TrinoCatalogFactory;
 import io.trino.plugin.iceberg.fileio.ForwardingFileIoFactory;
@@ -38,6 +39,7 @@ public class TrinoNessieCatalogFactory
     private final TypeManager typeManager;
     private final TrinoFileSystemFactory fileSystemFactory;
     private final ForwardingFileIoFactory fileIoFactory;
+    private final TableMetadataCache tableMetadataCache;
 
     @Inject
     public TrinoNessieCatalogFactory(
@@ -48,7 +50,8 @@ public class TrinoNessieCatalogFactory
             IcebergTableOperationsProvider tableOperationsProvider,
             NessieIcebergClient nessieClient,
             IcebergNessieCatalogConfig icebergNessieCatalogConfig,
-            IcebergConfig icebergConfig)
+            IcebergConfig icebergConfig,
+            TableMetadataCache tableMetadataCache)
     {
         this.catalogName = requireNonNull(catalogName, "catalogName is null");
         this.fileSystemFactory = requireNonNull(fileSystemFactory, "fileSystemFactory is null");
@@ -58,11 +61,12 @@ public class TrinoNessieCatalogFactory
         this.nessieClient = requireNonNull(nessieClient, "nessieClient is null");
         this.warehouseLocation = icebergNessieCatalogConfig.getDefaultWarehouseDir();
         this.isUniqueTableLocation = icebergConfig.isUniqueTableLocation();
+        this.tableMetadataCache = requireNonNull(tableMetadataCache, "tableMetadataCache is null");
     }
 
     @Override
     public TrinoCatalog create(ConnectorIdentity identity)
     {
-        return new TrinoNessieCatalog(catalogName, typeManager, fileSystemFactory, fileIoFactory, tableOperationsProvider, nessieClient, warehouseLocation, isUniqueTableLocation);
+        return new TrinoNessieCatalog(catalogName, typeManager, fileSystemFactory, fileIoFactory, tableOperationsProvider, nessieClient, warehouseLocation, isUniqueTableLocation, tableMetadataCache);
     }
 }
