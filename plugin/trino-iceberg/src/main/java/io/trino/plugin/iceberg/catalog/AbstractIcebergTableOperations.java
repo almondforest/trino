@@ -85,6 +85,7 @@ public abstract class AbstractIcebergTableOperations
     protected final Optional<String> owner;
     protected final Optional<String> location;
     protected final FileIO fileIo;
+    private final TableMetadataCache tableMetadataCache;
 
     protected TableMetadata currentMetadata;
     protected String currentMetadataLocation;
@@ -99,12 +100,25 @@ public abstract class AbstractIcebergTableOperations
             Optional<String> owner,
             Optional<String> location)
     {
+        this(fileIo, session, database, table, owner, location, TableMetadataCache.disabled());
+    }
+
+    protected AbstractIcebergTableOperations(
+            FileIO fileIo,
+            ConnectorSession session,
+            String database,
+            String table,
+            Optional<String> owner,
+            Optional<String> location,
+            TableMetadataCache tableMetadataCache)
+    {
         this.fileIo = requireNonNull(fileIo, "fileIo is null");
         this.session = requireNonNull(session, "session is null");
         this.database = requireNonNull(database, "database is null");
         this.tableName = requireNonNull(table, "table is null");
         this.owner = requireNonNull(owner, "owner is null");
         this.location = requireNonNull(location, "location is null");
+        this.tableMetadataCache = requireNonNull(tableMetadataCache, "tableMetadataCache is null");
     }
 
     @Override
@@ -144,6 +158,17 @@ public abstract class AbstractIcebergTableOperations
 
     @Override
     public void commit(@Nullable TableMetadata base, TableMetadata metadata)
+    {
+        try {
+            commitInternal(base, metadata);
+        }
+        finally {
+            // Whether the commit succeeded or was rejected because the base was stale, the cached metadata is no longer current
+            tableMetadataCache.invalidate(getSchemaTableName());
+        }
+    }
+
+    private void commitInternal(@Nullable TableMetadata base, TableMetadata metadata)
     {
         requireNonNull(metadata, "metadata is null");
 

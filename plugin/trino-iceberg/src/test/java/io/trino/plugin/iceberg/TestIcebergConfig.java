@@ -38,6 +38,7 @@ import static io.trino.plugin.iceberg.IcebergFileFormat.ORC;
 import static io.trino.plugin.iceberg.IcebergFileFormat.PARQUET;
 import static java.util.concurrent.TimeUnit.DAYS;
 import static java.util.concurrent.TimeUnit.HOURS;
+import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 public class TestIcebergConfig
@@ -80,6 +81,9 @@ public class TestIcebergConfig
                 .setAllowedExtraProperties(ImmutableList.of())
                 .setIncrementalRefreshEnabled(true)
                 .setMetadataCacheEnabled(true)
+                .setTableMetadataCacheTtl(new Duration(0, SECONDS))
+                .setFileIndexEnabled(false)
+                .setFileIndexMaxFiles(1_000_000)
                 .setIncrementalRefreshEnabled(true)
                 .setObjectStoreLayoutEnabled(false)
                 .setMetadataParallelism(8)
@@ -125,6 +129,9 @@ public class TestIcebergConfig
                 .put("iceberg.allowed-extra-properties", "propX,propY")
                 .put("iceberg.incremental-refresh-enabled", "false")
                 .put("iceberg.metadata-cache.enabled", "false")
+                .put("iceberg.table-metadata-cache.ttl", "5m")
+                .put("iceberg.file-index.enabled", "true")
+                .put("iceberg.file-index.max-files", "5000")
                 .put("iceberg.object-store-layout.enabled", "true")
                 .put("iceberg.metadata.parallelism", "10")
                 .put("iceberg.bucket-execution", "false")
@@ -166,6 +173,9 @@ public class TestIcebergConfig
                 .setAllowedExtraProperties(ImmutableList.of("propX", "propY"))
                 .setIncrementalRefreshEnabled(false)
                 .setMetadataCacheEnabled(false)
+                .setTableMetadataCacheTtl(new Duration(5, MINUTES))
+                .setFileIndexEnabled(true)
+                .setFileIndexMaxFiles(5000)
                 .setIncrementalRefreshEnabled(false)
                 .setObjectStoreLayoutEnabled(true)
                 .setMetadataParallelism(10)

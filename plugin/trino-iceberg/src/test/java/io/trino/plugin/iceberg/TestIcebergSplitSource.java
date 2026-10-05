@@ -192,7 +192,8 @@ public class TestIcebergSplitSource
                 new IcebergConfig().getMinimumAssignedSplitWeight(),
                 new DefaultCachingHostAddressProvider(),
                 new InMemoryMetricsReporter(),
-                newDirectExecutorService())) {
+                newDirectExecutorService(),
+                Optional.empty())) {
             ImmutableList.Builder<IcebergSplit> splits = ImmutableList.builder();
             while (!splitSource.isFinished()) {
                 splitSource.getNextBatch(100).get()
@@ -418,7 +419,8 @@ public class TestIcebergSplitSource
                 0,
                 new DefaultCachingHostAddressProvider(),
                 new InMemoryMetricsReporter(),
-                newDirectExecutorService())) {
+                newDirectExecutorService(),
+                Optional.empty())) {
             ImmutableList.Builder<IcebergSplit> builder = ImmutableList.builder();
             while (!splitSource.isFinished()) {
                 splitSource.getNextBatch(100).get()

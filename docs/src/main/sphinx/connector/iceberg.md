@@ -193,6 +193,19 @@ implementation is used:
   - Set to `false` to disable in-memory caching of metadata files on the
     coordinator. This cache is not used when `fs.cache.enabled` is set to true.
   - `true`
+* - `iceberg.table-metadata-cache.ttl`
+  - The [duration](prop-type-duration) for which loaded table metadata is
+    reused across queries, even if the table changes in the catalog. Applies to
+    the JDBC and Nessie catalogs. See [](iceberg-table-metadata-cache).
+  - `0s`
+* - `iceberg.file-index.enabled`
+  - Plan table scans from an in-memory index of a snapshot's data files for
+    tables that declare indexed columns. See [](iceberg-file-index).
+  - `false`
+* - `iceberg.file-index.max-files`
+  - Maximum number of data files held in coordinator memory across all indexed
+    snapshots. A snapshot with more data files is not indexed.
+  - `1000000`
 * - `iceberg.object-store-layout.enabled`
   - Set to `true` to enable Iceberg's [object store file layout](https://iceberg.apache.org/docs/latest/aws/#object-store-file-layout). 
     Enabling the object store file layout appends a deterministic hash directly 
@@ -2206,3 +2219,63 @@ Additionally, you can use the following catalog configuration properties:
 * - `fs.memory-cache.max-content-length`
   - The maximum file size that can be cached. Defaults to `15MB`.
  :::
+
+(iceberg-table-metadata-cache)=
+### Table metadata caching
+
+By default, every query asks the catalog for the current state of each table it
+uses. With the JDBC and Nessie catalogs, the `iceberg.table-metadata-cache.ttl`
+catalog configuration property keeps the loaded table metadata in coordinator
+memory for the configured duration and reuses it for all queries, so that the
+catalog is not contacted and the table metadata file is not parsed again.
+
+While an entry is cached, changes made to the table by other engines or other
+Trino clusters are not visible. This includes new data, schema changes, and
+dropping the table. A query can fail if it uses cached metadata that refers to
+files that were removed in the meantime, for example by snapshot expiration.
+
+Changes made through the same catalog on the same cluster are visible
+immediately.
+
+(iceberg-file-index)=
+### File index
+
+Planning a table scan reads the manifest files of the table snapshot to find the
+data files that match the query filter. With
+`iceberg.file-index.enabled=true`, the coordinator keeps the complete list of
+data files of a snapshot in memory, and finds the matching files with a search
+tree over the value ranges of selected columns instead.
+
+The index is used for tables that list the columns to index in the
+`trino.file-index.columns` table property. The property must be allowed with
+`iceberg.allowed-extra-properties`, and is set with the `extra_properties` table
+property:
+
+```sql
+ALTER TABLE example.sales.orders
+SET PROPERTIES extra_properties = MAP(
+    ARRAY['trino.file-index.columns'],
+    ARRAY['order_date, customer_id']);
+```
+
+List the columns that your queries filter on:
+
+* The index is used for a query only if all columns that the query filters on,
+  apart from filters that select whole partitions, are listed. Other queries are
+  planned from manifest files.
+* The search tree is built for columns of type `INTEGER`, `BIGINT`, `DATE`,
+  `TIME`, `TIMESTAMP(6)`, `TIMESTAMP(6) WITH TIME ZONE`, `VARCHAR`, and
+  `DECIMAL`. Listed columns of other types are filtered with the file statistics
+  without a search tree.
+
+The index of a snapshot is built in the background when a query first uses that
+snapshot. Until it is ready, queries are planned from manifest files. Building
+the index reads all manifest files of the snapshot.
+
+The index is held in coordinator memory: one entry per data file, with the
+value ranges of the listed columns. Only the most recently indexed snapshot of
+each table is kept, and `iceberg.file-index.max-files` limits the total number
+of data files across all tables. Size the coordinator heap accordingly.
+
+The index is used for split generation only. Table statistics are still read
+from manifest files.

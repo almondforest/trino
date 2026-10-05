@@ -24,6 +24,7 @@ import io.trino.metastore.TableInfo;
 import io.trino.plugin.iceberg.IcebergUtil;
 import io.trino.plugin.iceberg.catalog.AbstractTrinoCatalog;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperationsProvider;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.fileio.ForwardingFileIoFactory;
 import io.trino.spi.TrinoException;
 import io.trino.spi.catalog.CatalogName;
@@ -99,6 +100,7 @@ public class TrinoJdbcCatalog
     private final JdbcCatalog jdbcCatalog;
     private final IcebergJdbcClient jdbcClient;
     private final String defaultWarehouseDir;
+    private final TableMetadataCache sharedTableMetadataCache;
 
     private final Cache<SchemaTableName, TableMetadata> tableMetadataCache = EvictableCacheBuilder.newBuilder()
             .maximumSize(PER_QUERY_CACHE_SIZE)
@@ -113,12 +115,14 @@ public class TrinoJdbcCatalog
             TrinoFileSystemFactory fileSystemFactory,
             ForwardingFileIoFactory fileIoFactory,
             boolean useUniqueTableLocation,
-            String defaultWarehouseDir)
+            String defaultWarehouseDir,
+            TableMetadataCache sharedTableMetadataCache)
     {
         super(catalogName, useUniqueTableLocation, typeManager, tableOperationsProvider, fileSystemFactory, fileIoFactory);
         this.jdbcCatalog = requireNonNull(jdbcCatalog, "jdbcCatalog is null");
         this.jdbcClient = requireNonNull(jdbcClient, "jdbcClient is null");
         this.defaultWarehouseDir = requireNonNull(defaultWarehouseDir, "defaultWarehouseDir is null");
+        this.sharedTableMetadataCache = requireNonNull(sharedTableMetadataCache, "sharedTableMetadataCache is null");
     }
 
     @Override
@@ -324,6 +328,7 @@ public class TrinoJdbcCatalog
         // Using IcebergJdbcClient because JdbcCatalog.registerTable causes the below error.
         // "Cannot invoke "org.apache.iceberg.util.SerializableSupplier.get()" because "this.hadoopConf" is null"
         jdbcClient.createTable(tableName.getSchemaName(), tableName.getTableName(), tableMetadata.metadataFileLocation());
+        invalidateTableCache(tableName);
     }
 
     @Override
@@ -332,6 +337,7 @@ public class TrinoJdbcCatalog
         if (!jdbcCatalog.dropTable(toIdentifier(tableName), false)) {
             throw new TableNotFoundException(tableName);
         }
+        invalidateTableCache(tableName);
     }
 
     @Override
@@ -377,6 +383,7 @@ public class TrinoJdbcCatalog
             throw new TrinoException(ICEBERG_CATALOG_ERROR, "Failed to rename table from %s to %s".formatted(from, to), e);
         }
         invalidateTableCache(from);
+        invalidateTableCache(to);
     }
 
     @Override
@@ -387,7 +394,9 @@ public class TrinoJdbcCatalog
             metadata = uncheckedCacheGet(
                     tableMetadataCache,
                     schemaTableName,
-                    () -> loadIcebergTable(this, tableOperationsProvider, session, schemaTableName).operations().current());
+                    () -> sharedTableMetadataCache.load(
+                            schemaTableName,
+                            () -> loadIcebergTable(this, tableOperationsProvider, session, schemaTableName).operations().current()));
         }
         catch (UncheckedExecutionException e) {
             throwIfUnchecked(e.getCause());
@@ -613,6 +622,7 @@ public class TrinoJdbcCatalog
     protected void invalidateTableCache(SchemaTableName schemaTableName)
     {
         tableMetadataCache.invalidate(schemaTableName);
+        sharedTableMetadataCache.invalidate(schemaTableName);
     }
 
     private static TableIdentifier toIdentifier(SchemaTableName table)

@@ -18,6 +18,7 @@ import com.google.inject.Inject;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.plugin.iceberg.IcebergConfig;
 import io.trino.plugin.iceberg.catalog.IcebergTableOperationsProvider;
+import io.trino.plugin.iceberg.catalog.TableMetadataCache;
 import io.trino.plugin.iceberg.catalog.TrinoCatalog;
 import io.trino.plugin.iceberg.catalog.TrinoCatalogFactory;
 import io.trino.plugin.iceberg.fileio.ForwardingFileIoFactory;
@@ -49,6 +50,7 @@ public class TrinoJdbcCatalogFactory
     private final boolean isUniqueTableLocation;
     private final Map<String, String> catalogProperties;
     private final JdbcClientPool clientPool;
+    private final TableMetadataCache tableMetadataCache;
 
     @Inject
     public TrinoJdbcCatalogFactory(
@@ -59,7 +61,8 @@ public class TrinoJdbcCatalogFactory
             ForwardingFileIoFactory fileIoFactory,
             IcebergJdbcClient jdbcClient,
             IcebergJdbcCatalogConfig jdbcConfig,
-            IcebergConfig icebergConfig)
+            IcebergConfig icebergConfig,
+            TableMetadataCache tableMetadataCache)
     {
         this.catalogName = requireNonNull(catalogName, "catalogName is null");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
@@ -70,6 +73,7 @@ public class TrinoJdbcCatalogFactory
         this.jdbcClient = requireNonNull(jdbcClient, "jdbcClient is null");
         this.jdbcCatalogName = jdbcConfig.getCatalogName();
         this.defaultWarehouseDir = jdbcConfig.getDefaultWarehouseDir();
+        this.tableMetadataCache = requireNonNull(tableMetadataCache, "tableMetadataCache is null");
 
         ImmutableMap.Builder<String, String> properties = ImmutableMap.builder();
         properties.put(URI, jdbcConfig.getConnectionUrl());
@@ -108,6 +112,7 @@ public class TrinoJdbcCatalogFactory
                 fileSystemFactory,
                 fileIoFactory,
                 isUniqueTableLocation,
-                defaultWarehouseDir);
+                defaultWarehouseDir,
+                tableMetadataCache);
     }
 }
