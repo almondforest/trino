@@ -112,6 +112,34 @@ final class TestIcebergFileIndexFileOperations
     }
 
     @Test
+    void testVarcharColumn()
+    {
+        String table = "test_file_index_varchar_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + table + " (id BIGINT, name VARCHAR) WITH (extra_properties = MAP(ARRAY['" + FILE_INDEX_COLUMNS + "'], ARRAY['name']))");
+        assertUpdate("INSERT INTO " + table + " VALUES (1, 'apple'), (2, 'banana')", 2);
+        assertUpdate("INSERT INTO " + table + " VALUES (3, 'cherry'), (4, 'date')", 2);
+        assertUpdate("INSERT INTO " + table + " VALUES (5, 'éclair'), (6, '中文'), (7, '😀')", 3);
+        // longer than the 16 characters Iceberg keeps of a string bound by default
+        assertUpdate("INSERT INTO " + table + " VALUES (8, 'a_value_longer_than_the_bound_1'), (9, 'a_value_longer_than_the_bound_2')", 2);
+        @Language("SQL") String query = "SELECT id FROM " + table + " WHERE name = 'cherry'";
+
+        assertQuery(query, "VALUES 3");
+        assertEventually(() -> assertThat(manifestReads(query)).isZero());
+        assertQuery(query, "VALUES 3");
+        assertQuery("SELECT id FROM " + table + " WHERE name IN ('apple', 'date', '中文')", "VALUES 1, 4, 6");
+        assertQuery("SELECT id FROM " + table + " WHERE name >= 'banana' AND name < 'd'", "VALUES 2, 3");
+        assertQuery("SELECT id FROM " + table + " WHERE name > 'date'", "VALUES 5, 6, 7");
+        assertQuery("SELECT id FROM " + table + " WHERE name LIKE 'a%'", "VALUES 1, 8, 9");
+        assertQuery("SELECT id FROM " + table + " WHERE name = 'a_value_longer_than_the_bound_2'", "VALUES 9");
+        assertQuery("SELECT id FROM " + table + " WHERE name = '😀'", "VALUES 7");
+        assertQueryReturnsEmptyResult("SELECT id FROM " + table + " WHERE name = 'coconut'");
+        assertQueryReturnsEmptyResult("SELECT id FROM " + table + " WHERE name IS NULL");
+        assertQuery("SELECT count(*) FROM " + table + " WHERE name IS NOT NULL", "VALUES 9");
+
+        assertUpdate("DROP TABLE " + table);
+    }
+
+    @Test
     void testTableWithoutIndexedColumnsIsPlannedFromManifests()
     {
         String table = "test_no_file_index_" + randomNameSuffix();

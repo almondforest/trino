@@ -16,6 +16,7 @@ package io.trino.plugin.iceberg.fileindex;
 import com.google.common.collect.AbstractIterator;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import io.airlift.slice.Slice;
 import io.trino.plugin.iceberg.IcebergColumnHandle;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.Range;
@@ -41,6 +42,7 @@ import org.apache.iceberg.expressions.ResidualEvaluator;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.types.Comparators;
 import org.apache.iceberg.types.Conversions;
+import org.apache.iceberg.types.Type.TypeID;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.util.StructLikeWrapper;
 
@@ -57,6 +59,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
@@ -88,7 +91,7 @@ public final class SnapshotFileIndex
     private final DeleteFile[][] deleteFiles;
     private final List<PartitionGroup> partitionGroups;
     private final Set<Integer> statisticsColumnIds;
-    private final Map<Integer, ColumnIndex> columnIndexes;
+    private final Map<Integer, ColumnIndex<?>> columnIndexes;
 
     private SnapshotFileIndex(
             Schema schema,
@@ -112,7 +115,7 @@ public final class SnapshotFileIndex
 
         this.partitionGroups = groupByPartition(specs, this.files);
 
-        ImmutableMap.Builder<Integer, ColumnIndex> columnIndexes = ImmutableMap.builder();
+        ImmutableMap.Builder<Integer, ColumnIndex<?>> columnIndexes = ImmutableMap.builder();
         for (NestedField column : statisticsColumns) {
             if (isIntervalIndexSupported(column.type())) {
                 columnIndexes.put(column.fieldId(), ColumnIndex.create(column, toTrinoType(column.type(), typeManager), this.files));
@@ -209,7 +212,7 @@ public final class SnapshotFileIndex
         int partitionCandidates = candidates.cardinality();
 
         for (Map.Entry<IcebergColumnHandle, Domain> entry : predicate.getDomains().orElseThrow().entrySet()) {
-            ColumnIndex columnIndex = columnIndexes.get(entry.getKey().getId());
+            ColumnIndex<?> columnIndex = columnIndexes.get(entry.getKey().getId());
             if (columnIndex != null) {
                 columnIndex.overlapping(entry.getValue(), files.length).ifPresent(candidates::and);
             }
@@ -321,14 +324,18 @@ public final class SnapshotFileIndex
         }
     }
 
-    private record ColumnIndex(Type type, IntervalIndex intervals, int[] filesWithoutBounds)
+    /**
+     * @param <T> type of the query bounds the interval index takes
+     * @param toIndexBound converts a bound of a Trino range to the type the interval index takes
+     */
+    private record ColumnIndex<T>(Type type, IntervalIndex<T> intervals, Function<Object, T> toIndexBound, int[] filesWithoutBounds)
     {
-        static ColumnIndex create(NestedField column, Type type, DataFile[] files)
+        static ColumnIndex<?> create(NestedField column, Type type, DataFile[] files)
         {
             int fieldId = column.fieldId();
             List<Integer> boundedFiles = new ArrayList<>();
-            List<Object> lowers = new ArrayList<>();
-            List<Object> uppers = new ArrayList<>();
+            List<ByteBuffer> lowers = new ArrayList<>();
+            List<ByteBuffer> uppers = new ArrayList<>();
             List<Integer> filesWithoutBounds = new ArrayList<>();
             for (int file = 0; file < files.length; file++) {
                 ByteBuffer lower = bound(files[file].lowerBounds(), fieldId);
@@ -338,15 +345,24 @@ public final class SnapshotFileIndex
                     continue;
                 }
                 boundedFiles.add(file);
-                lowers.add(Conversions.fromByteBuffer(column.type(), lower));
-                uppers.add(Conversions.fromByteBuffer(column.type(), upper));
+                lowers.add(lower);
+                uppers.add(upper);
             }
-            @SuppressWarnings("unchecked")
-            Comparator<Object> comparator = (Comparator<Object>) (Comparator<?>) Comparators.forType(column.type().asPrimitiveType());
-            return new ColumnIndex(
+            int[] boundedFileIds = boundedFiles.stream().mapToInt(Integer::intValue).toArray();
+            int[] fileIdsWithoutBounds = filesWithoutBounds.stream().mapToInt(Integer::intValue).toArray();
+
+            if (column.type().typeId() == TypeID.STRING) {
+                // Trino and Iceberg both order strings by code point, which is the order of their UTF-8 bytes.
+                // The bounds stay encoded, and are compared with the bytes of the Trino value.
+                return new ColumnIndex<>(type, IntervalIndex.forUtf8(boundedFileIds, lowers, uppers), Slice.class::cast, fileIdsWithoutBounds);
+            }
+
+            Comparator<Object> comparator = Comparators.forType(column.type().asPrimitiveType());
+            return new ColumnIndex<>(
                     type,
-                    new IntervalIndex(comparator, boundedFiles.stream().mapToInt(Integer::intValue).toArray(), lowers, uppers),
-                    filesWithoutBounds.stream().mapToInt(Integer::intValue).toArray());
+                    IntervalIndex.forValues(comparator, boundedFileIds, decode(column, lowers), decode(column, uppers)),
+                    value -> convertTrinoValueToIceberg(type, value),
+                    fileIdsWithoutBounds);
         }
 
         /**
@@ -363,17 +379,26 @@ public final class SnapshotFileIndex
                 overlapping.set(file);
             }
             for (Range range : domain.getValues().getRanges().getOrderedRanges()) {
-                Object low = null;
+                T low = null;
                 if (!range.isLowUnbounded()) {
-                    low = convertTrinoValueToIceberg(type, range.getLowBoundedValue());
+                    low = toIndexBound.apply(range.getLowBoundedValue());
                 }
-                Object high = null;
+                T high = null;
                 if (!range.isHighUnbounded()) {
-                    high = convertTrinoValueToIceberg(type, range.getHighBoundedValue());
+                    high = toIndexBound.apply(range.getHighBoundedValue());
                 }
                 intervals.collectOverlapping(low, range.isLowInclusive(), high, range.isHighInclusive(), overlapping);
             }
             return Optional.of(overlapping);
+        }
+
+        private static List<Object> decode(NestedField column, List<ByteBuffer> bounds)
+        {
+            List<Object> values = new ArrayList<>(bounds.size());
+            for (ByteBuffer bound : bounds) {
+                values.add(Conversions.fromByteBuffer(column.type(), bound));
+            }
+            return values;
         }
 
         private static ByteBuffer bound(Map<Integer, ByteBuffer> bounds, int fieldId)

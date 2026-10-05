@@ -92,6 +92,8 @@ final class TestSnapshotFileIndex
     private static final List<String> INDEXED_COLUMNS = ImmutableList.of("id", "day", "name", "amount", "score");
     private static final Namespace NAMESPACE = Namespace.of("test_file_index");
     private static final int FIRST_DAY = 19_000;
+    // one, two, three and four byte encodings, with characters on both sides of the surrogate range
+    private static final int[] NAME_CODE_POINTS = {'a', 'b', 'c', 0xE9, 0x4E2D, 0xFFFD, 0x1F600};
     private static final int DAYS = 20;
 
     private final ExecutorService executor = newDirectExecutorService();
@@ -492,7 +494,7 @@ final class TestSnapshotFileIndex
         StringBuilder name = new StringBuilder();
         int length = 1 + random.nextInt(3);
         for (int i = 0; i < length; i++) {
-            name.append((char) ('a' + random.nextInt(6)));
+            name.appendCodePoint(NAME_CODE_POINTS[random.nextInt(NAME_CODE_POINTS.length)]);
         }
         return name.toString();
     }
