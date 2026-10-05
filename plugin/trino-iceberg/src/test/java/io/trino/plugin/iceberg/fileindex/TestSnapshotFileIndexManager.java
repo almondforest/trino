@@ -14,6 +14,8 @@
 package io.trino.plugin.iceberg.fileindex;
 
 import com.google.common.collect.ImmutableMap;
+import io.trino.plugin.iceberg.fileindex.SnapshotFileIndex.BuildStatistics;
+import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Schema;
@@ -95,6 +97,27 @@ final class TestSnapshotFileIndexManager
         assertThat(newIndex.orElseThrow().fileCount()).isEqualTo(5);
         assertThat(manager.find(table, secondSnapshot)).containsSame(newIndex.orElseThrow());
         assertThat(submitted).hasSize(2);
+    }
+
+    @Test
+    void testNewSnapshotIsBuiltFromPreviousIndex()
+    {
+        SnapshotFileIndexManager manager = new SnapshotFileIndexManager(true, 1000, TESTING_TYPE_MANAGER, directExecutor(), planningExecutor);
+        Table table = createTable(Optional.of("id"));
+        fastAppendFiles(table, 3);
+        fastAppendFiles(table, 3);
+        SnapshotFileIndex index = manager.find(table, table.currentSnapshot().snapshotId()).orElseThrow();
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(true, 2, 0));
+
+        fastAppendFiles(table, 2);
+        SnapshotFileIndex newIndex = manager.find(table, table.currentSnapshot().snapshotId()).orElseThrow();
+        assertThat(newIndex.fileCount()).isEqualTo(8);
+        assertThat(newIndex.buildStatistics()).isEqualTo(new BuildStatistics(true, 1, 2));
+
+        // an index of other columns holds files with other statistics, and is not built upon
+        table.updateProperties().set(FILE_INDEX_COLUMNS, "name").commit();
+        SnapshotFileIndex nameIndex = manager.find(table, table.currentSnapshot().snapshotId()).orElseThrow();
+        assertThat(nameIndex.buildStatistics()).isEqualTo(new BuildStatistics(true, 3, 0));
     }
 
     @Test
@@ -243,7 +266,17 @@ final class TestSnapshotFileIndexManager
 
     private static void appendFiles(Table table, int count)
     {
-        var append = table.newAppend();
+        appendFiles(table.newAppend(), table, count);
+    }
+
+    // always writes one new manifest and leaves the others alone
+    private static void fastAppendFiles(Table table, int count)
+    {
+        appendFiles(table.newFastAppend(), table, count);
+    }
+
+    private static void appendFiles(AppendFiles append, Table table, int count)
+    {
         for (int file = 0; file < count; file++) {
             append.appendFile(DataFiles.builder(table.spec())
                     .withPath(table.location() + "/data/" + randomNameSuffix() + ".parquet")

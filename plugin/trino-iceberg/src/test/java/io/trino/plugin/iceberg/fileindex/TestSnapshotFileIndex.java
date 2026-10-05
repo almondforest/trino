@@ -19,6 +19,7 @@ import com.google.common.collect.ImmutableSet;
 import io.airlift.slice.Slices;
 import io.trino.plugin.iceberg.IcebergColumnHandle;
 import io.trino.plugin.iceberg.PartitionData;
+import io.trino.plugin.iceberg.fileindex.SnapshotFileIndex.BuildStatistics;
 import io.trino.plugin.iceberg.fileindex.SnapshotFileIndex.FileIndexScan;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.Range;
@@ -50,6 +51,7 @@ import org.junit.jupiter.api.TestInstance;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -183,6 +185,163 @@ final class TestSnapshotFileIndex
     }
 
     @Test
+    void testReusesManifestsOfPreviousIndex()
+    {
+        Table table = createTable(PartitionSpec.builderFor(SCHEMA).identity("day").build());
+        Random random = new Random(21);
+        // a fast append always writes one new manifest and leaves the others alone
+        for (int day = FIRST_DAY; day < FIRST_DAY + 6; day++) {
+            fastAppend(table, random, 3, day);
+        }
+        SnapshotFileIndex index = buildIndex(table, INDEXED_COLUMNS);
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(true, 6, 0));
+        assertThat(index.fileCount()).isEqualTo(18);
+        assertSameFilesAsScan(table, index);
+
+        // only the manifest of the new files is read
+        fastAppend(table, random, 3, FIRST_DAY + 6);
+        index = buildIndex(table, INDEXED_COLUMNS, Optional.of(index));
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(true, 1, 6));
+        assertThat(index.fileCount()).isEqualTo(21);
+        assertSameFilesAsScan(table, index);
+
+        // dropping a day leaves its manifest without live files, so nothing is read
+        dropDay(table, FIRST_DAY);
+        index = buildIndex(table, INDEXED_COLUMNS, Optional.of(index));
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(true, 0, 6));
+        assertThat(index.fileCount()).isEqualTo(18);
+        assertSameFilesAsScan(table, index);
+
+        // a manifest that keeps some of its files is rewritten when the others are dropped, and is read again
+        var append = table.newFastAppend();
+        append.appendFile(randomDataFile(table, random, FIRST_DAY + 7));
+        append.appendFile(randomDataFile(table, random, FIRST_DAY + 7));
+        append.appendFile(randomDataFile(table, random, FIRST_DAY + 8));
+        append.commit();
+        index = buildIndex(table, INDEXED_COLUMNS, Optional.of(index));
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(true, 1, 6));
+        dropDay(table, FIRST_DAY + 7);
+        index = buildIndex(table, INDEXED_COLUMNS, Optional.of(index));
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(true, 1, 6));
+        assertThat(index.fileCount()).isEqualTo(19);
+        assertSameFilesAsScan(table, index);
+
+        // building again from an index of the same snapshot reads nothing
+        index = buildIndex(table, INDEXED_COLUMNS, Optional.of(index));
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(true, 0, 7));
+        assertSameFilesAsScan(table, index);
+    }
+
+    @Test
+    void testIncrementalBuildAfterRandomCommits()
+    {
+        Table table = catalog.buildTable(TableIdentifier.of(NAMESPACE, "table_" + randomNameSuffix()), SCHEMA)
+                .withPartitionSpec(PartitionSpec.builderFor(SCHEMA).identity("day").build())
+                .withProperty("format-version", "2")
+                // small manifests that are merged often, so that commits keep rewriting them
+                .withProperty("commit.manifest.target-size-bytes", "12000")
+                .withProperty("commit.manifest.min-count-to-merge", "3")
+                .create();
+        Random random = new Random(22);
+        fastAppend(table, random, 2, FIRST_DAY);
+        SnapshotFileIndex index = buildIndex(table, INDEXED_COLUMNS);
+
+        long manifestsRead = 0;
+        long manifestsReused = 0;
+        int commitsReadingNothingOrOneManifest = 0;
+        for (int commit = 0; commit < 200; commit++) {
+            int operation = random.nextInt(20);
+            if (operation < 10) {
+                appendRandomFiles(table, random, 1 + random.nextInt(4));
+            }
+            else if (operation < 13) {
+                fastAppend(table, random, 1 + random.nextInt(4), FIRST_DAY + random.nextInt(DAYS));
+            }
+            else if (operation < 16) {
+                dropDay(table, FIRST_DAY + random.nextInt(DAYS));
+            }
+            else if (operation < 18) {
+                compactTwoFiles(table, random);
+            }
+            else if (operation < 19) {
+                table.rewriteManifests().clusterBy(_ -> "all").commit();
+            }
+            else if (table.specs().size() == 1) {
+                table.updateSpec().addField(org.apache.iceberg.expressions.Expressions.bucket("id", 4)).commit();
+                appendRandomFiles(table, random, 2);
+            }
+
+            index = buildIndex(table, INDEXED_COLUMNS, Optional.of(index));
+            BuildStatistics statistics = index.buildStatistics();
+            assertThat(statistics.fromManifests()).isTrue();
+            assertSameFilesAsScan(table, index);
+            manifestsRead += statistics.manifestsRead();
+            manifestsReused += statistics.manifestsReused();
+            if (statistics.manifestsRead() <= 1) {
+                commitsReadingNothingOrOneManifest++;
+            }
+            if (commit % 20 == 0) {
+                assertMatchesPlanFiles(table, index, random, 20);
+            }
+        }
+        assertThat(table.specs()).hasSize(2);
+        // most manifests survive a commit unchanged
+        assertThat(manifestsReused).isGreaterThan(manifestsRead);
+        assertThat(commitsReadingNothingOrOneManifest).isGreaterThan(50);
+    }
+
+    @Test
+    void testSnapshotWithDeleteFilesIsBuiltFromScan()
+    {
+        Table table = createTable(PartitionSpec.builderFor(SCHEMA).identity("day").build());
+        Random random = new Random(23);
+        fastAppend(table, random, 3, FIRST_DAY);
+        fastAppend(table, random, 3, FIRST_DAY + 1);
+        SnapshotFileIndex index = buildIndex(table, INDEXED_COLUMNS);
+        assertThat(index.buildStatistics().fromManifests()).isTrue();
+
+        DeleteFile deleteFile = FileMetadata.deleteFileBuilder(table.spec())
+                .ofPositionDeletes()
+                .withPath("memory:///deletes/" + randomNameSuffix() + ".parquet")
+                .withFormat(FileFormat.PARQUET)
+                .withFileSizeInBytes(10)
+                .withRecordCount(1)
+                .withPartition(new PartitionData(new Object[] {FIRST_DAY}))
+                .build();
+        table.newRowDelta().addDeletes(deleteFile).commit();
+
+        // which delete files apply to a data file is left to the table scan to work out
+        index = buildIndex(table, INDEXED_COLUMNS, Optional.of(index));
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(false, 0, 0));
+        assertSameFilesAsScan(table, index);
+        assertThat(deletesByDataFile(index.planFiles(alwaysTrue(), TupleDomain.all()).tasks()).values()).anyMatch(deletes -> !deletes.isEmpty());
+
+        // and so are later snapshots, for as long as the delete file is there
+        fastAppend(table, random, 2, FIRST_DAY + 2);
+        index = buildIndex(table, INDEXED_COLUMNS, Optional.of(index));
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(false, 0, 0));
+        assertSameFilesAsScan(table, index);
+    }
+
+    @Test
+    void testManifestsAreNotReusedAcrossDifferentStatisticsColumns()
+    {
+        Table table = createTable(PartitionSpec.unpartitioned());
+        Random random = new Random(24);
+        fastAppend(table, random, 3, FIRST_DAY);
+        fastAppend(table, random, 3, FIRST_DAY);
+        SnapshotFileIndex idIndex = buildIndex(table, ImmutableList.of("id"));
+        assertThat(idIndex.buildStatistics()).isEqualTo(new BuildStatistics(true, 2, 0));
+
+        // the files held by the previous index lack the statistics of the added columns
+        SnapshotFileIndex index = buildIndex(table, INDEXED_COLUMNS, Optional.of(idIndex));
+        assertThat(index.buildStatistics()).isEqualTo(new BuildStatistics(true, 2, 0));
+        assertThat(index.hasStatisticsFor(ImmutableSet.of(1, 2, 3, 4, 5))).isTrue();
+        assertSameFilesAsScan(table, index);
+        assertMatchesPlanFiles(table, index, random, 50);
+    }
+
+    @Test
     void testIndexIsBoundToItsSnapshot()
     {
         Table table = createTable(PartitionSpec.unpartitioned());
@@ -191,7 +350,7 @@ final class TestSnapshotFileIndex
         long firstSnapshot = table.currentSnapshot().snapshotId();
         appendRandomFiles(table, random, 5);
 
-        SnapshotFileIndex firstIndex = SnapshotFileIndex.build(table, firstSnapshot, INDEXED_COLUMNS, TESTING_TYPE_MANAGER, executor, 1000).orElseThrow();
+        SnapshotFileIndex firstIndex = SnapshotFileIndex.build(table, firstSnapshot, INDEXED_COLUMNS, TESTING_TYPE_MANAGER, executor, 1000, Optional.empty()).orElseThrow();
         assertThat(firstIndex.fileCount()).isEqualTo(10);
         assertThat(buildIndex(table, INDEXED_COLUMNS).fileCount()).isEqualTo(15);
     }
@@ -203,8 +362,8 @@ final class TestSnapshotFileIndex
         appendRandomFiles(table, new Random(12), 10);
         long snapshotId = table.currentSnapshot().snapshotId();
 
-        assertThat(SnapshotFileIndex.build(table, snapshotId, INDEXED_COLUMNS, TESTING_TYPE_MANAGER, executor, 9)).isEmpty();
-        assertThat(SnapshotFileIndex.build(table, snapshotId, INDEXED_COLUMNS, TESTING_TYPE_MANAGER, executor, 10)).isPresent();
+        assertThat(SnapshotFileIndex.build(table, snapshotId, INDEXED_COLUMNS, TESTING_TYPE_MANAGER, executor, 9, Optional.empty())).isEmpty();
+        assertThat(SnapshotFileIndex.build(table, snapshotId, INDEXED_COLUMNS, TESTING_TYPE_MANAGER, executor, 10, Optional.empty())).isPresent();
     }
 
     @Test
@@ -326,7 +485,13 @@ final class TestSnapshotFileIndex
 
     private void assertMatchesPlanFiles(Table table, Random random, int queries)
     {
-        SnapshotFileIndex index = buildIndex(table, INDEXED_COLUMNS);
+        long prunedQueries = assertMatchesPlanFiles(table, buildIndex(table, INDEXED_COLUMNS), random, queries);
+        // guards against a generator that only produces filters matching everything
+        assertThat(prunedQueries).isGreaterThan(queries / 2);
+    }
+
+    private static long assertMatchesPlanFiles(Table table, SnapshotFileIndex index, Random random, int queries)
+    {
         long prunedQueries = 0;
         for (int query = 0; query < queries; query++) {
             TupleDomain<IcebergColumnHandle> predicate = randomPredicate(random);
@@ -340,8 +505,54 @@ final class TestSnapshotFileIndex
                 prunedQueries++;
             }
         }
-        // guards against a generator that only produces filters matching everything
-        assertThat(prunedQueries).isGreaterThan(queries / 2);
+        return prunedQueries;
+    }
+
+    private static void fastAppend(Table table, Random random, int count, int day)
+    {
+        var append = table.newFastAppend();
+        for (int file = 0; file < count; file++) {
+            append.appendFile(randomDataFile(table, random, day));
+        }
+        append.commit();
+    }
+
+    private static void dropDay(Table table, int day)
+    {
+        table.newDelete()
+                .deleteFromRowFilter(org.apache.iceberg.expressions.Expressions.equal("day", LocalDate.ofEpochDay(day).toString()))
+                .commit();
+    }
+
+    /**
+     * Replaces two files with a single new file, as compaction does.
+     */
+    private static void compactTwoFiles(Table table, Random random)
+    {
+        List<DataFile> files = new ArrayList<>();
+        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                files.add(task.file());
+            }
+        }
+        catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        if (files.size() < 2) {
+            return;
+        }
+        DataFile first = files.get(random.nextInt(files.size()));
+        DataFile second = files.get(random.nextInt(files.size()));
+        if (first.location().equals(second.location())) {
+            return;
+        }
+        // day is the first partition field of every spec these tables use
+        int day = first.partition().get(0, Integer.class);
+        table.newRewrite()
+                .deleteFile(first)
+                .deleteFile(second)
+                .addFile(randomDataFile(table, random, day))
+                .commit();
     }
 
     private static TupleDomain<IcebergColumnHandle> randomPredicate(Random random)
@@ -413,41 +624,45 @@ final class TestSnapshotFileIndex
     {
         var append = table.newAppend();
         for (int file = 0; file < count; file++) {
-            int day = FIRST_DAY + random.nextInt(DAYS);
-            long idLower = random.nextInt(1000);
-            long idUpper = idLower + random.nextInt(60);
-
-            Map<Integer, Object> lowerBounds = new HashMap<>();
-            Map<Integer, Object> upperBounds = new HashMap<>();
-            Map<Integer, Long> nullCounts = new HashMap<>();
-            // a tenth of the files have no statistics for id
-            if (random.nextInt(10) != 0) {
-                lowerBounds.put(1, idLower);
-                upperBounds.put(1, idUpper);
-            }
-            lowerBounds.put(2, day);
-            upperBounds.put(2, day);
-            if (random.nextInt(10) != 0) {
-                String nameLower = randomName(random);
-                lowerBounds.put(3, nameLower);
-                upperBounds.put(3, nameLower + randomName(random));
-                nullCounts.put(3, (long) random.nextInt(2));
-            }
-            else {
-                // only NULLs
-                nullCounts.put(3, 100L);
-            }
-            long amountLower = random.nextInt(100_000);
-            lowerBounds.put(4, BigDecimal.valueOf(amountLower, 2));
-            upperBounds.put(4, BigDecimal.valueOf(amountLower + random.nextInt(5_000), 2));
-            nullCounts.put(4, (long) random.nextInt(2));
-            double scoreLower = random.nextInt(100);
-            lowerBounds.put(5, scoreLower);
-            upperBounds.put(5, scoreLower + random.nextInt(10));
-
-            append.appendFile(dataFile(table, "file_" + randomNameSuffix(), partition(table.spec(), day, idLower), lowerBounds, upperBounds, nullCounts));
+            append.appendFile(randomDataFile(table, random, FIRST_DAY + random.nextInt(DAYS)));
         }
         append.commit();
+    }
+
+    private static DataFile randomDataFile(Table table, Random random, int day)
+    {
+        long idLower = random.nextInt(1000);
+        long idUpper = idLower + random.nextInt(60);
+
+        Map<Integer, Object> lowerBounds = new HashMap<>();
+        Map<Integer, Object> upperBounds = new HashMap<>();
+        Map<Integer, Long> nullCounts = new HashMap<>();
+        // a tenth of the files have no statistics for id
+        if (random.nextInt(10) != 0) {
+            lowerBounds.put(1, idLower);
+            upperBounds.put(1, idUpper);
+        }
+        lowerBounds.put(2, day);
+        upperBounds.put(2, day);
+        if (random.nextInt(10) != 0) {
+            String nameLower = randomName(random);
+            lowerBounds.put(3, nameLower);
+            upperBounds.put(3, nameLower + randomName(random));
+            nullCounts.put(3, (long) random.nextInt(2));
+        }
+        else {
+            // only NULLs
+            nullCounts.put(3, 100L);
+        }
+        long amountLower = random.nextInt(100_000);
+        lowerBounds.put(4, BigDecimal.valueOf(amountLower, 2));
+        upperBounds.put(4, BigDecimal.valueOf(amountLower + random.nextInt(5_000), 2));
+        nullCounts.put(4, (long) random.nextInt(2));
+        double scoreLower = random.nextInt(100);
+        lowerBounds.put(5, scoreLower);
+        upperBounds.put(5, scoreLower + random.nextInt(10));
+
+        return dataFile(table, "file_" + randomNameSuffix(), partition(table.spec(), day, idLower), lowerBounds, upperBounds, nullCounts);
     }
 
     private static PartitionData partition(PartitionSpec spec, int day, long id)
@@ -509,10 +724,62 @@ final class TestSnapshotFileIndex
 
     private SnapshotFileIndex buildIndex(Table table, List<String> columns)
     {
-        Optional<SnapshotFileIndex> index = SnapshotFileIndex.build(table, table.currentSnapshot().snapshotId(), columns, TESTING_TYPE_MANAGER, executor, 100_000);
+        return buildIndex(table, columns, Optional.empty());
+    }
+
+    private SnapshotFileIndex buildIndex(Table table, List<String> columns, Optional<SnapshotFileIndex> previous)
+    {
+        Optional<SnapshotFileIndex> index = SnapshotFileIndex.build(table, table.currentSnapshot().snapshotId(), columns, TESTING_TYPE_MANAGER, executor, 100_000, previous);
         assertThat(index).isPresent();
         return index.orElseThrow();
     }
+
+    /**
+     * Compares everything split generation reads from a file with what a scan of the table returns.
+     */
+    private static void assertSameFilesAsScan(Table table, SnapshotFileIndex index)
+    {
+        assertThat(describeFiles(table, index.planFiles(alwaysTrue(), TupleDomain.all()).tasks()))
+                .isEqualTo(describeFiles(table, table.newScan().includeColumnStats(INDEXED_COLUMNS).planFiles()));
+    }
+
+    private static Map<String, FileDescription> describeFiles(Table table, CloseableIterable<FileScanTask> tasks)
+    {
+        try (tasks) {
+            return ImmutableList.copyOf(tasks).stream()
+                    .collect(toImmutableMap(
+                            task -> task.file().location(),
+                            task -> {
+                                DataFile file = task.file();
+                                return new FileDescription(
+                                        file.specId(),
+                                        table.specs().get(file.specId()).partitionToPath(file.partition()),
+                                        file.recordCount(),
+                                        file.fileSizeInBytes(),
+                                        file.dataSequenceNumber(),
+                                        file.fileSequenceNumber(),
+                                        Optional.ofNullable(file.lowerBounds()).orElse(ImmutableMap.of()),
+                                        Optional.ofNullable(file.upperBounds()).orElse(ImmutableMap.of()),
+                                        Optional.ofNullable(file.nullValueCounts()).orElse(ImmutableMap.of()),
+                                        task.deletes().stream().map(DeleteFile::location).collect(toImmutableSet()));
+                            }));
+        }
+        catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private record FileDescription(
+            int specId,
+            String partition,
+            long recordCount,
+            long fileSize,
+            Long dataSequenceNumber,
+            Long fileSequenceNumber,
+            Map<Integer, ByteBuffer> lowerBounds,
+            Map<Integer, ByteBuffer> upperBounds,
+            Map<Integer, Long> nullValueCounts,
+            Set<String> deleteFiles) {}
 
     private static Expression alwaysTrue()
     {

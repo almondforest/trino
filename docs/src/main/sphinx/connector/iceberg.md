@@ -2269,8 +2269,15 @@ List the columns that your queries filter on:
   without a search tree.
 
 The index of a snapshot is built in the background when a query first uses that
-snapshot. Until it is ready, queries are planned from manifest files. Building
-the index reads all manifest files of the snapshot.
+snapshot. Until it is ready, queries are planned from manifest files.
+
+The first index of a table is built by reading all manifest files of the
+snapshot. The index of a later snapshot is built from the previous one, and only
+the manifest files that the previous snapshot did not have are read. This covers
+inserts and deletes of whole partitions. A snapshot of a table that has
+row-level deletes, which are written by `DELETE`, `UPDATE`, and `MERGE`
+statements that do not remove whole partitions, is always built by reading all
+manifest files.
 
 The index is held in coordinator memory: one entry per data file, with the
 value ranges of the listed columns. Only the most recently indexed snapshot of
