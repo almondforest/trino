@@ -13,6 +13,7 @@
  */
 package io.trino.plugin.iceberg;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Multiset;
 import io.trino.Session;
@@ -29,8 +30,12 @@ import org.junit.jupiter.api.parallel.ExecutionMode;
 import java.nio.file.Path;
 
 import static com.google.common.collect.ImmutableMultiset.toImmutableMultiset;
+import static io.trino.SystemSessionProperties.ENABLE_DYNAMIC_FILTERING;
+import static io.trino.SystemSessionProperties.JOIN_DISTRIBUTION_TYPE;
+import static io.trino.SystemSessionProperties.JOIN_REORDERING_STRATEGY;
 import static io.trino.plugin.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
 import static io.trino.plugin.iceberg.fileindex.SnapshotFileIndexManager.FILE_INDEX_COLUMNS;
+import static io.trino.plugin.iceberg.util.FileOperationUtils.FileType.DATA;
 import static io.trino.plugin.iceberg.util.FileOperationUtils.FileType.MANIFEST;
 import static io.trino.plugin.iceberg.util.FileOperationUtils.FileType.SNAPSHOT;
 import static io.trino.plugin.iceberg.util.FileOperationUtils.getOperations;
@@ -180,6 +185,54 @@ final class TestIcebergFileIndexFileOperations
     }
 
     @Test
+    void testJoinWithDynamicFilter()
+    {
+        String indexedTable = "test_file_index_dynamic_filter_" + randomNameSuffix();
+        String plainTable = "test_no_file_index_dynamic_filter_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + indexedTable + " (id BIGINT, name VARCHAR, code VARCHAR) WITH (extra_properties = MAP(ARRAY['" + FILE_INDEX_COLUMNS + "'], ARRAY['name']))");
+        assertUpdate("CREATE TABLE " + plainTable + " (id BIGINT, name VARCHAR, code VARCHAR)");
+        for (String table : ImmutableList.of(indexedTable, plainTable)) {
+            assertUpdate("INSERT INTO " + table + " VALUES (1, 'a', 'u'), (2, 'b', 'v')", 2);
+            assertUpdate("INSERT INTO " + table + " VALUES (3, 'c', 'w'), (4, 'd', 'x')", 2);
+            assertUpdate("INSERT INTO " + table + " VALUES (5, 'e', 'y'), (6, 'f', 'z')", 2);
+        }
+        // split generation waits for the dynamic filter, so the filter is known when the files are looked up
+        Session dynamicFiltering = Session.builder(getSession())
+                .setCatalogSessionProperty(ICEBERG_CATALOG, "dynamic_filtering_wait_timeout", "1m")
+                .setSystemProperty(JOIN_REORDERING_STRATEGY, "NONE")
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, "BROADCAST")
+                .build();
+        Session noDynamicFiltering = Session.builder(dynamicFiltering)
+                .setSystemProperty(ENABLE_DYNAMIC_FILTERING, "false")
+                .build();
+
+        // The build side value is only known when the query runs. With a constant, the optimizer would turn the join
+        // condition into a static filter on the table, and leave nothing to the dynamic filter.
+        // The dynamic filter is on the indexed column.
+        @Language("SQL") String onName = "SELECT t.id FROM %s t JOIN (SELECT IF(rand() >= 0, 'c') AS name) d ON t.name = d.name";
+        assertQuery(dynamicFiltering, onName.formatted(indexedTable), "VALUES 3");
+        assertEventually(() -> assertThat(manifestReads(dynamicFiltering, onName.formatted(indexedTable))).isZero());
+        assertQuery(dynamicFiltering, onName.formatted(indexedTable), "VALUES 3");
+        // the files it rules out are not opened, the same as without the index
+        int dataFileReads = dataFileReads(dynamicFiltering, onName.formatted(indexedTable));
+        assertThat(dataFileReads).isEqualTo(dataFileReads(dynamicFiltering, onName.formatted(plainTable)));
+        assertThat(dataFileReads).isLessThan(dataFileReads(noDynamicFiltering, onName.formatted(indexedTable)));
+        assertQuery(noDynamicFiltering, onName.formatted(indexedTable), "VALUES 3");
+
+        // the dynamic filter is on a column the index holds no statistics for: the scan is planned from manifests,
+        // and the dynamic filter prunes files as it does without the index
+        @Language("SQL") String onCode = "SELECT t.id FROM %s t JOIN (SELECT IF(rand() >= 0, 'x') AS code) d ON t.code = d.code";
+        assertQuery(dynamicFiltering, onCode.formatted(indexedTable), "VALUES 4");
+        assertThat(manifestReads(dynamicFiltering, onCode.formatted(indexedTable))).isGreaterThan(0);
+        assertThat(dataFileReads(dynamicFiltering, onCode.formatted(indexedTable)))
+                .isEqualTo(dataFileReads(dynamicFiltering, onCode.formatted(plainTable)))
+                .isLessThan(dataFileReads(noDynamicFiltering, onCode.formatted(indexedTable)));
+
+        assertUpdate("DROP TABLE " + indexedTable);
+        assertUpdate("DROP TABLE " + plainTable);
+    }
+
+    @Test
     void testTableWithoutIndexedColumnsIsPlannedFromManifests()
     {
         String table = "test_no_file_index_" + randomNameSuffix();
@@ -195,13 +248,28 @@ final class TestIcebergFileIndexFileOperations
         assertUpdate("DROP TABLE " + table);
     }
 
-    private synchronized int manifestReads(@Language("SQL") String query)
+    private int manifestReads(@Language("SQL") String query)
     {
-        getDistributedQueryRunner().executeWithPlan(getSession(), query);
-        Multiset<FileType> readFileTypes = getOperations(getDistributedQueryRunner().getSpans()).stream()
+        return manifestReads(getSession(), query);
+    }
+
+    private int manifestReads(Session session, @Language("SQL") String query)
+    {
+        Multiset<FileType> readFileTypes = readFileTypes(session, query);
+        return readFileTypes.count(MANIFEST) + readFileTypes.count(SNAPSHOT);
+    }
+
+    private int dataFileReads(Session session, @Language("SQL") String query)
+    {
+        return readFileTypes(session, query).count(DATA);
+    }
+
+    private synchronized Multiset<FileType> readFileTypes(Session session, @Language("SQL") String query)
+    {
+        getDistributedQueryRunner().executeWithPlan(session, query);
+        return getOperations(getDistributedQueryRunner().getSpans()).stream()
                 .filter(operation -> operation.operationType().startsWith("InputFile."))
                 .map(FileOperation::fileType)
                 .collect(toImmutableMultiset());
-        return readFileTypes.count(MANIFEST) + readFileTypes.count(SNAPSHOT);
     }
 }

@@ -2574,6 +2574,9 @@ List the columns that your queries filter on:
 * The index is used for a query only if all columns that the query filters on,
   apart from filters that select whole partitions, are listed. Other queries are
   planned from manifest files.
+* A column that receives a [dynamic filter](/admin/dynamic-filtering) from a
+  join counts as a filtered column, even if it is a partitioning column. List
+  the join keys of the table to have its joins planned from the index.
 * The search tree is built for columns of type `INTEGER`, `BIGINT`, `DATE`,
   `TIME`, `TIMESTAMP(6)`, `TIMESTAMP(6) WITH TIME ZONE`, `VARCHAR`, and
   `DECIMAL`. Listed columns of other types are filtered with the file statistics
