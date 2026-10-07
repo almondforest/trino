@@ -24,5 +24,5 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: m2-repo
-        path: ~/.m2/repository/
+        path: ~/.m2/repository/io/trino/trino-iceberg/
         retention-days: 1
