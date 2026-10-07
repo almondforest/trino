@@ -18,11 +18,11 @@ jobs:
         distribution: 'temurin'
         
     - name: Build with Maven
-      run: mvn -B -DskipTests install
+      run: mvn -B -DskipTests install -N
       
     - name: Archive m2 repo
       uses: actions/upload-artifact@v4
       with:
         name: m2-repo
-        path: /home/runner/.m2
+        path: ~/.m2/repository/
         retention-days: 1
