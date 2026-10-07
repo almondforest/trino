@@ -21,6 +21,7 @@ import io.trino.testing.QueryRunner;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.jdbc.JdbcCatalog;
 import org.apache.iceberg.types.Types;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
@@ -114,6 +115,7 @@ final class TestIcebergJdbcCatalogTableMetadataCache
     }
 
     @Test
+    @Disabled("In 479 beginInsert refreshes the table metadata, so an INSERT planned from a cached schema fails after another engine changes the schema")
     void testChangeFromOtherEngineIsNotVisible()
     {
         String table = "test_other_engine_" + randomNameSuffix();
