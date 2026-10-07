@@ -1,4 +1,4 @@
-name: Java CI with Maven
+name: Pack m2 with trino and dependencies
 
 on:
   workflow_dispatch:  
